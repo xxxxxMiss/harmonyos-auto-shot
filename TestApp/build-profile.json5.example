@@ -1,0 +1,55 @@
+// 复制本文件为 build-profile.json5，并填入你自己本机的调试证书信息。
+// 获取方式（DevEco Studio）：
+//   File -> Project Structure -> Signing Configs -> 勾选 Automatically generate signature
+//   （或登录华为账号后自动生成），生成后证书默认在 ~/.ohos/config/ 目录下。
+// 下面的 <...> 都是占位符，务必替换成实际值，否则无法签名构建。
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "<替换为你本机的 .cer 路径，如 ~/.ohos/config/xxx.cer>",
+          "keyAlias": "debugKey",
+          "keyPassword": "<替换为 keyPassword，DevEco 生成的调试密钥密码>",
+          "profile": "<替换为你本机的 .p7b 路径，如 ~/.ohos/config/xxx.p7b>",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "<替换为你本机的 .p12 路径，如 ~/.ohos/config/xxx.p12>",
+          "storePassword": "<替换为 storePassword，DevEco 生成的调试密钥库密码>"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "6.1.0(23)",
+        "targetSdkVersion": "6.1.0(23)",
+        "runtimeOS": "HarmonyOS"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

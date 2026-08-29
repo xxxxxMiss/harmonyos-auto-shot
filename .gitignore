@@ -26,5 +26,10 @@ scenes.auto.yaml
 oh_modules/
 .hvigor/
 
+# ---- 签名配置（含本机调试证书与密钥，不入库）----
+# 根级 build-profile.json5 含 signingConfigs（证书路径/密钥密码），
+# 用 build-profile.json5.example 作为模板，clone 后自行填写。
+TestApp/build-profile.json5
+
 # ---- macOS ----
 .DS_Store
