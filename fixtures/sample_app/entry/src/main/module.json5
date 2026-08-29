@@ -1,0 +1,16 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "abilities": [
+      {
+        "name": "EntryAbility",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
+        "skills": [
+          { "actions": ["action.system.home"], "uris": [{ "scheme": "sampleapp", "host": "page" }] }
+        ]
+      }
+    ],
+    "pages": ["pages/Index"]
+  }
+}

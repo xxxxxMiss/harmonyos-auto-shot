@@ -1,0 +1,12 @@
+{
+  "string": [
+    { "name": "app_name", "value": "示例应用" },
+    { "name": "main_title", "value": "首页" },
+    { "name": "settings_title", "value": "设置" },
+    { "name": "settings_about", "value": "关于本应用" },
+    { "name": "login_button", "value": "登录" },
+    { "name": "network_error", "value": "网络连接不可用，请检查网络设置" },
+    { "name": "remaining_count", "value": "还剩%d个" },
+    { "name": "unused_string", "value": "没人引用我" }
+  ]
+}

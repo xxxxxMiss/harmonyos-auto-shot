@@ -1,0 +1,18 @@
+# autoshot 项目配置示例：复制到目标工程根目录并改名为 autoshot.yaml
+# 所有字段均可省略，CLI 参数优先级更高
+
+# device_serial: "127.0.0.1:5555"
+# hdc_path: hdc
+# screen_size: [1080, 2340]
+# image_format: png            # png | jpeg（设备截屏恒为 JPEG，png 需装 Pillow 转码）
+# locale: zh_CN                # 限定语种；缺省用所有语种值参与匹配
+# output_dir: shots
+# max_scroll_steps: 12
+# viewport_margin_top: 96
+# viewport_margin_bottom: 96
+# viewport_margin_side: 16
+# idle_timeout: 6.0
+# poll_interval: 0.4
+# scroll_direction: up
+# grant_texts: ["允许", "仅使用期间允许"]
+# dismiss_texts: ["我知道了", "暂不升级"]

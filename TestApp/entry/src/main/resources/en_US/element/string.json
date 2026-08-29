@@ -1,0 +1,28 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "AutoShot screenshot test app" },
+    { "name": "EntryAbility_desc", "value": "AutoShot screenshot test app" },
+    { "name": "EntryAbility_label", "value": "AutoShot Demo" },
+    { "name": "main_title", "value": "Home" },
+    { "name": "nav_settings", "value": "Open Settings" },
+    { "name": "nav_list", "value": "Open Long List" },
+    { "name": "nav_state", "value": "Open State Demo" },
+    { "name": "rm_hello", "value": "Hello, resourceManager" },
+    { "name": "remaining_count", "value": "%d items left" },
+    { "name": "settings_title", "value": "Settings" },
+    { "name": "settings_about", "value": "About this app" },
+    { "name": "dialog_button", "value": "Show dialog" },
+    { "name": "dialog_message", "value": "This is a dialog message sample" },
+    { "name": "toast_button", "value": "Show toast" },
+    { "name": "toast_message", "value": "This is a toast message" },
+    { "name": "back_home", "value": "Back to home" },
+    { "name": "list_title", "value": "Long List Page" },
+    { "name": "list_target", "value": "Deep target item" },
+    { "name": "state_title", "value": "State Demo Page" },
+    { "name": "toggle_offline", "value": "Simulate offline" },
+    { "name": "toggle_empty", "value": "Toggle empty list" },
+    { "name": "network_error", "value": "Network unavailable, check your settings" },
+    { "name": "empty_list", "value": "The list is empty" },
+    { "name": "unused_string", "value": "Nobody references me" }
+  ]
+}

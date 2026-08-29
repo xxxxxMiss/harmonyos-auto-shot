@@ -1,0 +1,10 @@
+{
+  "name": "auto-shot-tools",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "auto-shot 阶段二 AST 静态分析内核的运行依赖（仅 tools/ast_scan.mjs 使用）",
+  "dependencies": {
+    "typescript": "^5.5.0"
+  }
+}

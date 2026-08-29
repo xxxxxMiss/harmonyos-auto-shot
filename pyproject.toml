@@ -1,0 +1,23 @@
+[project]
+name = "autoshot"
+version = "0.1.0"
+description = "HarmonyOS NEXT 语种资源截图自动化工具（auto-shot）"
+requires-python = ">=3.9"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+image = ["Pillow>=10.0"]   # png 输出格式转换需要（截屏原始输出为 JPEG）
+ocr = ["rapidocr-onnxruntime>=1.3"]  # 可选：截图输入反查 key
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+autoshot = "autoshot.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["autoshot*"]

@@ -1,0 +1,30 @@
+# ---- Python ----
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ---- Node ----
+node_modules/
+
+# ---- 截图产物 ----
+shots/
+batch_shots/
+cap_shots/
+demo_shots/
+
+# ---- 临时输出 ----
+usage_index.json
+.autoshot_scenes_tmp.yaml
+scenes.auto.yaml
+
+# ---- HarmonyOS 构建产物 ----
+**/build/
+**/.hvigor/
+**/oh_modules/
+oh_modules/
+.hvigor/
+
+# ---- macOS ----
+.DS_Store

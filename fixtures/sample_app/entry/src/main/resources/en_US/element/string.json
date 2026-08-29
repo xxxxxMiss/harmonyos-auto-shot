@@ -1,0 +1,12 @@
+{
+  "string": [
+    { "name": "app_name", "value": "Sample App" },
+    { "name": "main_title", "value": "Home" },
+    { "name": "settings_title", "value": "Settings" },
+    { "name": "settings_about", "value": "About this app" },
+    { "name": "login_button", "value": "Sign in" },
+    { "name": "network_error", "value": "Network unavailable, check your settings" },
+    { "name": "remaining_count", "value": "%d items left" },
+    { "name": "unused_string", "value": "nobody references me" }
+  ]
+}

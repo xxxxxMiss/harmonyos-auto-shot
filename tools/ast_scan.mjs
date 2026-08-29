@@ -1,0 +1,587 @@
+#!/usr/bin/env node
+/**
+ * auto-shot 阶段二静态分析内核（AST 后端）。
+ *
+ * 流程：struct→class 词法预处理 → TypeScript Compiler API 解析 →
+ *   R1 $r / R2 .id 换取 / R3 按名字面量 / R4 常量传播 / R5 函数摘要(i18n 封装) / R6 查表
+ *   → 上下文分类（visible / conditional[条件源码] / click / runtime）
+ *   → 导航图（module.json5 pages + router/NavPathStack 边 + import 归属）
+ *
+ * 用法：node tools/ast_scan.mjs <projectRoot> [outJsonPath]
+ * 输出：JSON（stdout 或 --out 文件），由 Python 侧 autoshot/scanner.py 调用合并。
+ */
+import ts from 'typescript';
+import fs from 'fs';
+import path from 'path';
+import { pathToFileURL } from 'url';
+
+const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href;
+
+const PRUNE = new Set(['oh_modules', 'node_modules', 'build', '.hvigor', '.preview',
+  '.cxx', '.idea', '.git', 'dist', '.test', 'entry/build']);
+const BYNAME = new Set(['getStringByNameSync', 'getStringByName', 'getPluralStringByNameSync',
+  'getPluralStringByName', 'getStringArrayByNameSync', 'getStringArrayByName']);
+const ID_APIS = new Set(['getStringSync', 'getStringValue', 'getString']);
+const DIALOG_CALLEE = ['AlertDialog.show', 'promptAction.showToast', 'promptAction.showDialog',
+  'promptAction.openCustomDialog', 'promptAction.showActionMenu',
+  'this.getUIContext().showAlertDialog', 'showToast', 'showDialog', 'openCustomDialog'];
+
+// ---------- 工具 ----------
+function fail(msg) { console.error('[ast_scan] ' + msg); process.exit(2); }
+function readText(p) { try { return fs.readFileSync(p, 'utf-8'); } catch { return null; } }
+function readJsonLoose(p) {
+  const t = readText(p); if (t == null) return null;
+  const clean = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/,(\s*[}\]])/g, '$1');
+  try { return JSON.parse(t); } catch { /* 宽松重试：去注释 + 去尾逗号 */ }
+  try { return JSON.parse(clean(t)); } catch { return null; }
+}
+function rel(root, p) { return path.relative(root, p).split(path.sep).join('/'); }
+
+// ---------- struct→class 预处理（跳过字符串与注释内的关键字） ----------
+export function preprocess(source) {
+  let out = '', i = 0, n = source.length;
+  let mode = 'code'; // code | line | block | squote | dquote | template
+  while (i < n) {
+    const c = source[i], c2 = source[i + 1];
+    if (mode === 'code') {
+      if (c === '/' && c2 === '/') { mode = 'line'; out += c + c2; i += 2; continue; }
+      if (c === '/' && c2 === '*') { mode = 'block'; out += c + c2; i += 2; continue; }
+      if (c === "'") { mode = 'squote'; out += c; i++; continue; }
+      if (c === '"') { mode = 'dquote'; out += c; i++; continue; }
+      if (c === '`') { mode = 'template'; out += c; i++; continue; }
+      if (/^[A-Za-z_$]/.test(c) && !/[A-Za-z0-9_$]/.test(source[i - 1] ?? '')) {
+        const m = /^struct\s+([A-Za-z_$][\w$]*)/.exec(source.slice(i, i + 200));
+        if (m && !/[A-Za-z0-9_$]/.test(source[i + 6] ?? '')) {
+          out += 'class ' + m[1]; i += m[0].length; continue;
+        }
+      }
+      out += c; i++; continue;
+    }
+    if (mode === 'line') { if (c === '\n') mode = 'code'; out += c; i++; continue; }
+    if (mode === 'block') { if (c === '*' && c2 === '/') { out += '*/'; i += 2; mode = 'code'; continue; } out += c; i++; continue; }
+    if (mode === 'squote' || mode === 'dquote') {
+      if (c === '\\') { out += c + (c2 ?? ''); i += 2; continue; }
+      if ((mode === 'squote' && c === "'") || (mode === 'dquote' && c === '"')) mode = 'code';
+      out += c; i++; continue;
+    }
+    // template
+    if (c === '\\') { out += c + (c2 ?? ''); i += 2; continue; }
+    if (c === '`') { mode = 'code'; out += c; i++; continue; }
+    out += c; i++; continue;
+  }
+  return out;
+}
+
+// ---------- 文件与页面发现 ----------
+function collectSourceFiles(root) {
+  const files = [];
+  (function walk(dir) {
+    let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) { if (!PRUNE.has(e.name)) walk(path.join(dir, e.name)); continue; }
+      if (e.name.endsWith('.ets') || e.name.endsWith('.ts')) files.push(path.join(dir, e.name));
+    }
+  })(root);
+  return files;
+}
+
+function discoverPages(root) {
+  const pages = []; // {name:'pages/Index', file:'entry/src/main/ets/pages/Index.ets', module}
+  const bp = readJsonLoose(path.join(root, 'build-profile.json5')) || {};
+  for (const mod of bp.app?.modules || bp.modules || []) {
+    const srcPath = mod.srcPath || mod.srcpath; if (!srcPath) continue;
+    const base = path.join(root, srcPath, 'src', 'main');
+    const moduleJson = readJsonLoose(path.join(base, 'module.json5')); if (!moduleJson) continue;
+    const pagesRef = moduleJson.module?.pages; // "$profile:main_pages" 或数组
+    let pageSrcs = [];
+    if (typeof pagesRef === 'string' && pagesRef.startsWith('$profile:')) {
+      const pj = readJsonLoose(path.join(base, 'resources', 'base', 'profile', pagesRef.slice('$profile:'.length) + '.json'));
+      pageSrcs = pj?.src || [];
+    } else if (Array.isArray(pagesRef)) pageSrcs = pagesRef;
+    for (const s of pageSrcs) {
+      const f = path.join(base, 'ets', s + '.ets');
+      pages.push({ name: s, file: rel(root, f), module: mod.name || path.basename(srcPath), exists: fs.existsSync(f) });
+    }
+  }
+  return pages;
+}
+
+// ---------- 每文件符号收集 ----------
+export function analyzeFile(root, filePath, sourceFile) {
+  const rec = {
+    file: rel(root, filePath),
+    consts: new Map(),        // name -> string 字面量
+    constObjs: new Map(),     // name -> Map(key -> string)
+    classes: new Map(),       // className -> {decorators, props: Map(prop->string), methods: Set}
+    functions: new Map(),     // funcName -> node
+    imports: new Map(),       // localName -> {spec, imported}
+    exports: new Set(),
+  };
+  // imports
+  for (const st of sourceFile.statements) {
+    if (ts.isImportDeclaration(st)) {
+      const spec = st.moduleSpecifier.text;
+      const bind = st.importClause?.namedBindings;
+      if (bind && ts.isNamedImports(bind)) {
+        for (const el of bind.elements) rec.imports.set(el.name.text, { spec, imported: el.propertyName?.text || el.name.text });
+      } else if (bind && ts.isNamespaceImport(bind)) {
+        rec.imports.set(bind.name.text, { spec, imported: '*', ns: true });
+      }
+    }
+  }
+  // 顶层声明
+  const visitTop = (node) => {
+    if (ts.isVariableStatement(node)) {
+      for (const d of node.declarationList.declarations) {
+        if (ts.isIdentifier(d.name) && d.initializer) {
+          if (ts.isStringLiteral(d.initializer)) rec.consts.set(d.name.text, d.initializer.text);
+          else if (ts.isObjectLiteralExpression(d.initializer)) {
+            const m = new Map();
+            for (const p of d.initializer.properties) {
+              if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && ts.isStringLiteral(p.initializer))
+                m.set(p.name.text, p.initializer.text);
+            }
+            rec.constObjs.set(d.name.text, m);
+          }
+        }
+      }
+    }
+    if (ts.isClassDeclaration(node) && node.name) {
+      const cls = { decorators: node.modifiers?.filter(ts.isDecorator).map(d => d.getText(sourceFile)) || [], props: new Map(), methods: new Set() };
+      for (const m of node.members) {
+        if (ts.isPropertyDeclaration(m) && ts.isIdentifier(m.name) && m.initializer && ts.isStringLiteral(m.initializer))
+          cls.props.set(m.name.text, m.initializer.text);
+        if (ts.isMethodDeclaration(m) && m.name) cls.methods.add(m.name.getText(sourceFile));
+      }
+      rec.classes.set(node.name.text, cls);
+      if (node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) rec.exports.add(node.name.text);
+    }
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      rec.functions.set(node.name.text, node);
+      if (node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) rec.exports.add(node.name.text);
+    }
+    if (ts.isExportDeclaration(node) || node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
+      if (ts.isVariableStatement(node)) for (const d of node.declarationList.declarations)
+        if (ts.isIdentifier(d.name)) rec.exports.add(d.name.text);
+    }
+  };
+  sourceFile.statements.forEach(visitTop);
+  return rec;
+}
+
+// 常量传播：Identifier / this.x / 对象取值
+function resolveString(expr, fileRec, currentClass, fileIndex, root, depth = 0) {
+  if (!expr || depth > 4) return null;
+  if (ts.isStringLiteral(expr)) return expr.text;
+  if (ts.isIdentifier(expr)) {
+    if (fileRec.consts.has(expr.text)) return fileRec.consts.get(expr.text);
+    // 跨文件：import { X } from './y'
+    const imp = fileRec.imports.get(expr.text);
+    if (imp && !imp.ns) {
+      const target = resolveImport(root, fileRec.file, imp.spec);
+      if (target && fileIndex.has(target)) {
+        const t = fileIndex.get(target);
+        if (t.consts.has(imp.imported)) return t.consts.get(imp.imported);
+      }
+    }
+    return null;
+  }
+  if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression) && expr.expression.text === 'this') {
+    return fileRec.classes.get(currentClass)?.props.get(expr.name.text) ?? null;
+  }
+  // constObj.key / constObj[idx]（R6 查表：key 已知才可解析，动态 idx 返回 null）
+  if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression)) {
+    const obj = fileRec.constObjs.get(expr.expression.text);
+    if (obj) return obj.get(expr.name.text) ?? null;
+  }
+  if (ts.isElementAccessExpression(expr) && ts.isIdentifier(expr.expression)) {
+    const obj = fileRec.constObjs.get(expr.expression.text);
+    if (obj && ts.isStringLiteral(expr.argumentValue)) return obj.get(expr.argumentValue.text) ?? null;
+  }
+  return null;
+}
+
+function resolveImport(root, fromFile, spec) {
+  if (!spec.startsWith('.')) return null;
+  const base = path.resolve(path.dirname(path.join(root, fromFile)), spec);
+  for (const cand of [base, base + '.ets', base + '.ts', path.join(base, 'index.ets'), path.join(base, 'index.ts')]) {
+    const relp = rel(root, cand);
+    if (fs.existsSync(cand) && !relp.startsWith('..')) return relp;
+  }
+  return null;
+}
+
+// ---------- i18n 访问器（R5 函数摘要） ----------
+export function findAccessors(sourceFile, fileRec) {
+  // 函数/静态方法体内以“自身参数”调用按名 API → 访问器
+  const found = [];
+  const checkFn = (fnName, className, params, body) => {
+    if (!body) return;
+    const hit = { name: fnName, className, paramIndex: -1, paramName: null, file: fileRec.file };
+    let matched = false;
+    const walk = (node) => {
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        const prop = ts.isPropertyAccessExpression(callee) ? callee.name.text : (ts.isIdentifier(callee) ? callee.text : null);
+        if (prop && BYNAME.has(prop) && node.arguments.length > 0) {
+          const a0 = node.arguments[0];
+          if (ts.isIdentifier(a0)) {
+            const idx = params.findIndex(p => p.name.getText(sourceFile) === a0.text);
+            if (idx >= 0) { hit.paramIndex = idx; hit.paramName = a0.text; matched = true; }
+          }
+        }
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(body);
+    if (matched) found.push(hit);
+  };
+  for (const [name, fn] of fileRec.functions) checkFn(name, null, fn.parameters, fn.body);
+  for (const [clsName, cls] of fileRec.classes) {
+    // 类方法在顶层 collect 时未存 node，这里重扫一遍 class
+    for (const st of sourceFile.statements) {
+      if (ts.isClassDeclaration(st) && st.name?.text === clsName) {
+        for (const m of st.members) {
+          if (ts.isMethodDeclaration(m) && m.name)
+            checkFn(m.name.getText(sourceFile), clsName, m.parameters, m.body);
+        }
+      }
+    }
+  }
+  return found;
+}
+
+// ---------- 上下文分类 ----------
+function classify(sourceFile, node, currentClass, currentFn) {
+  const tags = []; let conditionText = null; let dialogNode = null;
+  let p = node.parent;
+  let fn = currentFn, cls = currentClass;
+  while (p) {
+    if (ts.isIfStatement(p) || ts.isConditionalExpression(p)) {
+      const cond = p.expression ?? p.condition;
+      if (!conditionText && cond) conditionText = cond.getText(sourceFile).replace(/\s+/g, ' ').slice(0, 120);
+      if (!tags.includes('conditional')) tags.push('conditional');
+    }
+    if (ts.isCallExpression(p)) {
+      const calleeText = p.expression.getText(sourceFile).replace(/\s+/g, '');
+      if (!dialogNode && DIALOG_CALLEE.some(d => calleeText.endsWith(d) || calleeText.includes(d))) {
+        dialogNode = p;
+        if (!tags.includes('click')) tags.push('click');
+      }
+      if (ts.isPropertyAccessExpression(p.expression)) {
+        const m = /^on[A-Z]/.exec(p.expression.name.text);
+        if (m && p.expression.name.text !== 'onAppear' && p.expression.name.text !== 'onDisappear') {
+          if (!tags.includes('runtime')) tags.push('runtime');
+        }
+        if (['catch', 'then', 'finally'].includes(p.expression.name.text) && !tags.includes('runtime')) tags.push('runtime');
+      }
+    }
+    if (ts.isClassDeclaration(p) && p.name) {
+      const decos = p.modifiers?.filter(ts.isDecorator).map(d => d.getText(sourceFile)).join(' ') || '';
+      if (decos.includes('CustomDialog') && !tags.includes('click')) tags.push('click');
+      cls = p.name.text;
+    }
+    if ((ts.isMethodDeclaration(p) || ts.isFunctionDeclaration(p) || ts.isArrowFunction(p)) && p.name) fn = p.name.getText(sourceFile);
+    p = p.parent;
+  }
+  // 优先级：click > conditional > runtime > visible
+  const hint = tags.includes('click') ? 'click' : tags.includes('conditional') ? 'conditional'
+    : tags.includes('runtime') ? 'runtime' : 'visible';
+  return { tags, hint, conditionText, fn, cls, dialogNode };
+}
+
+// ---------- 触发标签提取：从 onClick 回调向上找挂载组件（Button/Text）的标签 ----------
+const STYLE_CHAIN = new Set(['width', 'height', 'margin', 'fontSize', 'backgroundColor', 'borderRadius',
+  'padding', 'fontWeight', 'fontColor', 'layoutWeight', 'alignItems', 'justifyContent', 'border', 'opacity']);
+
+function labelOfArg(arg0) {
+  if (!arg0) return null;
+  if (ts.isCallExpression(arg0) && ts.isIdentifier(arg0.expression) && arg0.expression.text === '$r') {
+    const r = arg0.arguments[0];
+    if (ts.isStringLiteral(r)) { const m = /^app\.string\.([A-Za-z_][\w]*)$/.exec(r.text); if (m) return { viaKey: m[1] }; }
+  }
+  if (ts.isStringLiteral(arg0)) return { viaText: arg0.text };
+  return null;
+}
+
+export function climbTriggerLabel(node, sourceFile) {
+  // 向上：找最近的 onXxx 回调宿主组件，如 Button($r(...)).width(...).onClick(() => {...})
+  let p = node.parent, arrow = null;
+  while (p) {
+    if (ts.isArrowFunction(p) || ts.isFunctionExpression(p)) { arrow = p; break; }
+    if (ts.isClassDeclaration(p) || ts.isSourceFile(p)) return null;
+    p = p.parent;
+  }
+  if (!arrow) return null;
+  const call = arrow.parent;
+  if (!ts.isCallExpression(call) || !ts.isPropertyAccessExpression(call.expression)) return null;
+  if (!/^on[A-Z]/.test(call.expression.name.text)) return null;
+  let inner = call.expression.expression;
+  while (ts.isCallExpression(inner) && ts.isPropertyAccessExpression(inner.expression)
+    && STYLE_CHAIN.has(inner.expression.name.text)) {
+    inner = inner.expression.expression;
+  }
+  if (ts.isCallExpression(inner) && ts.isIdentifier(inner.expression) && inner.arguments.length > 0) {
+    return labelOfArg(inner.arguments[0]);
+  }
+  return null;
+}
+
+// ---------- 主流程 ----------
+function main() {
+  const root = process.argv[2]; if (!root || !fs.existsSync(root)) fail('工程根不存在: ' + root);
+  const outPath = process.argv[3];
+  const files = collectSourceFiles(root);
+  const pages = discoverPages(root);
+  const pageByFile = new Map(pages.filter(p => p.exists).map(p => [p.file, p.name]));
+
+  const parsed = [];
+  for (const f of files) {
+    const raw = readText(f); if (raw == null) continue;
+    const src = ts.createSourceFile(f, preprocess(raw), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const rec = analyzeFile(root, f, src);
+    parsed.push({ abs: f, src, rec });
+  }
+  const fileIndex = new Map(parsed.map(p => [p.rec.file, p.rec]));
+
+  // 访问器总表（含跨文件）
+  const accessors = []; // {name, className, paramIndex, file}
+  for (const p of parsed) accessors.push(...findAccessors(p.src, p.rec));
+
+  // 访问器匹配：本地函数/类 或 经 import 解析到定义文件
+  function matchAccessor(rec, callee) {
+    if (ts.isIdentifier(callee)) {
+      const local = accessors.find(x => x.file === rec.file && !x.className && x.name === callee.text);
+      if (local) return local;
+      const imp = rec.imports.get(callee.text);
+      if (imp) {
+        const target = resolveImport(root, rec.file, imp.spec);
+        if (target) return accessors.find(x => x.file === target && !x.className && x.name === imp.imported) || null;
+      }
+      return null;
+    }
+    if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
+      const clsName = callee.expression.text;
+      const local = accessors.find(x => x.file === rec.file && x.className === clsName && x.name === callee.name.text);
+      if (local) return local;
+      const imp = rec.imports.get(clsName);
+      if (imp) {
+        const target = resolveImport(root, rec.file, imp.spec);
+        if (target) return accessors.find(x => x.file === target && x.className === imp.imported && x.name === callee.name.text) || null;
+      }
+    }
+    return null;
+  }
+
+  const usages = []; const dynamicRefs = []; const edges = []; const toggles = [];
+  for (const p of parsed) {
+    const { src, rec } = p;
+    let currentClass = null, currentFn = null;
+    const classStack = [], fnStack = [];
+    const enter = (node) => {
+      if (ts.isClassDeclaration(node) && node.name) { currentClass = node.name.text; classStack.push(currentClass); }
+      if ((ts.isMethodDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isArrowFunction(node)) ) {
+        currentFn = node.name ? node.name.getText(src) : (ts.isArrowFunction(node) && ts.isVariableDeclaration(node.parent) ? node.parent.name.getText(src) : currentFn);
+        fnStack.push(currentFn);
+      }
+    };
+    const exit = (node) => {
+      if (ts.isClassDeclaration(node)) { classStack.pop(); currentClass = classStack[classStack.length - 1] ?? null; }
+      if (ts.isMethodDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isArrowFunction(node)) { fnStack.pop(); currentFn = fnStack[fnStack.length - 1] ?? null; }
+    };
+    const pushUsage = (node, key, rule) => {
+      const { tags, hint, conditionText, fn, cls, dialogNode } = classify(src, node, currentClass, currentFn);
+      const { line } = src.getLineAndCharacterOfPosition(node.getStart(src));
+      usages.push({
+        key, rule, file: rec.file, line: line + 1,
+        lineText: node.getText(src).replace(/\s+/g, ' ').slice(0, 160),
+        triggers: tags, triggerHint: hint, conditionText, struct: cls, method: fn,
+        _src: src, _dialogNode: dialogNode,
+      });
+    };
+    const pushDynamic = (node, expr) => {
+      const { line } = src.getLineAndCharacterOfPosition(node.getStart(src));
+      dynamicRefs.push({ expr, file: rec.file, line: line + 1, lineText: expr });
+    };
+
+    const walk = (node) => {
+      enter(node);
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        const calleeProp = ts.isPropertyAccessExpression(callee) ? callee.name.text : null;
+        const calleeId = ts.isIdentifier(callee) ? callee.text : null;
+        const args = node.arguments;
+        // R1/R2：$r('app.string.x') 或 getStringSync($r(...).id, ...)
+        if (calleeId === '$r' && args.length > 0 && ts.isStringLiteral(args[0])) {
+          const m = /^app\.string\.([A-Za-z_][\w]*)$/.exec(args[0].text);
+          if (m) pushUsage(node, m[1], 'R1_$r');
+        }
+        if (calleeProp && ID_APIS.has(calleeProp) && args.length > 0 &&
+          ts.isPropertyAccessExpression(args[0]) && args[0].name.text === 'id' &&
+          ts.isCallExpression(args[0].expression) && ts.isIdentifier(args[0].expression.expression) &&
+          args[0].expression.expression.text === '$r') {
+          const r = args[0].expression.arguments[0];
+          if (ts.isStringLiteral(r)) {
+            const m = /^app\.string\.([A-Za-z_][\w]*)$/.exec(r.text);
+            if (m) pushUsage(node, m[1], 'R2_id');
+          }
+        }
+        // R3/R4：按名 API
+        if (calleeProp && BYNAME.has(calleeProp) && args.length > 0) {
+          const a0 = args[0];
+          if (ts.isStringLiteral(a0)) pushUsage(node, a0.text, 'R3_byname');
+          else {
+            // 访问器定义内部的“参数转发”不是动态引用（调用点已由 R5 解析）
+            const inAccessorBody = accessors.some(a => a.file === rec.file
+              && (a.className ?? null) === (currentClass ?? null) && a.name === currentFn
+              && ts.isIdentifier(a0) && a.paramName === a0.text);
+            if (inAccessorBody) { ts.forEachChild(node, walk); exit(node); return; }
+            const resolved = resolveString(a0, rec, currentClass, fileIndex, root);
+            if (resolved != null) pushUsage(node, resolved, 'R4_const');
+            else pushDynamic(node, a0.getText(src).replace(/\s+/g, ' ').slice(0, 80));
+          }
+        }
+        // R5/R6：i18n 封装调用
+        if (args.length > 0) {
+          const acc = matchAccessor(rec, callee);
+          if (acc) {
+            const a = args[acc.paramIndex];
+            if (ts.isStringLiteral(a)) pushUsage(node, a.text, 'R5_wrapper');
+            else {
+              const resolved = resolveString(a, rec, currentClass, fileIndex, root);
+              if (resolved != null) pushUsage(node, resolved, 'R5_wrapper');
+              else pushDynamic(node, callee.getText(src).replace(/\s+/g, ' ') + '(' + a.getText(src).replace(/\s+/g, ' ').slice(0, 60) + ')');
+            }
+          }
+        }
+        // 状态开关采集：onXxx 回调内对 this.X 赋值 → 记录 {varName, 触发按钮标签}
+        if (calleeProp && /^on[A-Z]/.test(calleeProp) && args.length > 0 &&
+            (ts.isArrowFunction(args[0]) || ts.isFunctionExpression(args[0])) && args[0].body) {
+          const bodyText = args[0].body.getText(src);
+          const vars = [...bodyText.matchAll(/this\.([A-Za-z_]\w*)\s*=(?![=>])/g)].map(m => m[1]);
+          if (vars.length) {
+            const label = climbTriggerLabel(args[0].body.statements[0] ?? args[0].body, src);
+            for (const v of new Set(vars)) toggles.push({ file: rec.file, varName: v, viaKey: label?.viaKey ?? null, viaText: label?.viaText ?? null });
+          }
+        }
+        // 导航边：router.pushUrl/replaceUrl({url:'pages/X'})、pushPathByName('X')
+        const apiName = calleeProp || calleeId || '';
+        if (['pushUrl', 'replaceUrl'].includes(apiName) && args.length > 0 && ts.isObjectLiteralExpression(args[0])) {
+          const via = climbTriggerLabel(node, src);
+          for (const prop of args[0].properties) {
+            if (ts.isPropertyAssignment(prop) && prop.name.getText(src) === 'url' && ts.isStringLiteral(prop.initializer)) {
+              edges.push({ from: rec.file, to: prop.initializer.text, api: apiName,
+                viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null });
+            }
+          }
+        }
+        if (apiName === 'pushPathByName' && args.length > 0 && ts.isStringLiteral(args[0])) {
+          const via = climbTriggerLabel(node, src);
+          edges.push({ from: rec.file, to: args[0].text, api: 'pushPathByName',
+            viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null });
+        }
+      }
+      ts.forEachChild(node, walk);
+      exit(node);
+    };
+    walk(src);
+  }
+
+  // import 图与 key→页面 归属
+  const importers = new Map(); // file -> Set(importers)
+  for (const p of parsed) {
+    for (const [, imp] of p.rec.imports) {
+      const target = resolveImport(root, p.rec.file, imp.spec);
+      if (target) {
+        if (!importers.has(target)) importers.set(target, new Set());
+        importers.get(target).add(p.rec.file);
+      }
+    }
+  }
+  function owningPages(file) {
+    // 该文件被哪些页面（直接或经 import 链）使用
+    const seen = new Set(); const result = new Set(); const queue = [file];
+    while (queue.length) {
+      const f = queue.shift(); if (seen.has(f)) continue; seen.add(f);
+      if (pageByFile.has(f)) result.add(pageByFile.get(f));
+      for (const im of importers.get(f) || []) if (!seen.has(im)) queue.push(im);
+    }
+    return [...result];
+  }
+  // 页面可达深度（BFS，入口 = pages[0]）
+  const pageNames = pages.map(p => p.name);
+  const depth = new Map(); const entry = pageNames[0];
+  if (entry != null) {
+    depth.set(entry, 0);
+    // 正向 BFS：边来源文件 → 所在页面
+    const pageOfFile = new Map(pages.filter(p => p.exists).map(p => [p.file, p.name]));
+    const adj = new Map();
+    for (const e of edges) {
+      if (!pageNames.includes(e.to)) continue;
+      for (const srcPage of pageOfFile.has(e.from) ? [pageOfFile.get(e.from)] : owningPages(e.from)) {
+        if (!adj.has(srcPage)) adj.set(srcPage, new Set());
+        adj.get(srcPage).add(e.to);
+      }
+    }
+    const q = [entry];
+    while (q.length) {
+      const cur = q.shift();
+      for (const nxt of adj.get(cur) || []) {
+        if (!depth.has(nxt)) { depth.set(nxt, depth.get(cur) + 1); q.push(nxt); }
+      }
+    }
+  }
+  const keyPages = {};
+  const byKeyFiles = new Map();
+  for (const u of usages) {
+    if (!byKeyFiles.has(u.key)) byKeyFiles.set(u.key, new Set());
+    byKeyFiles.get(u.key).add(u.file);
+  }
+  for (const [key, fsSet] of byKeyFiles) {
+    const s = new Set();
+    for (const f of fsSet) for (const pg of owningPages(f)) s.add(pg);
+    if (s.size === 0) continue;   // 无页面归属（工程片段/非页面文件）不产出
+    keyPages[key] = [...s].map(pg => ({ page: pg, depth: depth.has(pg) ? depth.get(pg) : null })).sort((a, b) => (a.depth ?? 99) - (b.depth ?? 99));
+  }
+
+  // ---- 触发信息富集（弹窗触发按钮 / 条件变量对应的开关按钮）----
+  for (const u of usages) {
+    if (u._dialogNode && u._src) {
+      const label = climbTriggerLabel(u._dialogNode, u._src);
+      if (label) { u.triggerViaKey = label.viaKey ?? null; u.triggerViaText = label.viaText ?? null; }
+    }
+    if (u.conditionText) {
+      const vars = [...u.conditionText.matchAll(/this\.([A-Za-z_]\w*)/g)].map(m => m[1]);
+      for (const v of new Set(vars)) {
+        const t = toggles.find(t => t.file === u.file && t.varName === v);
+        if (t) { u.toggleVar = v; u.toggleViaKey = t.viaKey; u.toggleViaText = t.viaText; break; }
+      }
+    }
+    delete u._src; delete u._dialogNode;
+  }
+
+  // ---- 页面级邻接表（含触发标签，供自动场景生成 BFS 用）----
+  const pageAdj = {};
+  {
+    const pageOfFile = new Map(pages.filter(p => p.exists).map(p => [p.file, p.name]));
+    for (const e of edges) {
+      if (!pages.some(p => p.name === e.to)) continue;
+      const srcPages = pageOfFile.has(e.from) ? [pageOfFile.get(e.from)] : owningPages(e.from);
+      for (const sp of srcPages) {
+        (pageAdj[sp] = pageAdj[sp] || []).push({ to: e.to, viaKey: e.viaKey ?? null, viaText: e.viaText ?? null });
+      }
+    }
+  }
+
+  const result = {
+    backend: 'ast', projectRoot: path.resolve(root), files: parsed.length,
+    usages, dynamicRefs,
+    accessors: accessors.map(a => ({ name: a.name, className: a.className, paramIndex: a.paramIndex, file: a.file })),
+    pages: pages.map(p => ({ name: p.name, file: p.file, exists: p.exists, depth: depth.has(p.name) ? depth.get(p.name) : null })),
+    edges, keyPages, pageAdj, toggles,
+  };
+  const json = JSON.stringify(result, null, 1);
+  if (outPath) fs.writeFileSync(outPath, json); else process.stdout.write(json);
+}
+
+if (isMain) main();

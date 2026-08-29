@@ -1,0 +1,63 @@
+# TestApp 真机验证场景表
+# 注意：触发型场景（点击后才出现目标文案的）要放在通用场景之前，
+# find_for_key 按声明顺序返回第一个命中场景。
+
+scenes:
+  # ---- 条件渲染：先点"模拟断网"，network_error 才出现 ----
+  network_error_scene:
+    keys: [network_error]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=状态演示页
+      - click: text=状态演示页
+      - click: text=模拟断网
+
+  # ---- 条件渲染：空列表态 ----
+  empty_list_scene:
+    keys: [empty_list]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=状态演示页
+      - click: text=状态演示页
+      - click: text=切换空列表
+
+  # ---- 点击触发：AlertDialog ----
+  dialog_scene:
+    keys: [dialog_message]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=打开设置页
+      - click: text=打开设置页
+      - click: text=显示弹窗
+
+  # ---- 点击触发：Toast（duration 8s，给截图留时间） ----
+  toast_scene:
+    keys: [toast_message]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=打开设置页
+      - click: text=打开设置页
+      - click: text=显示Toast
+
+  # ---- 懒加载列表深处的目标项（验证滚动到视野） ----
+  list_scene:
+    keys: [list_target, list_title]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=查看长列表
+      - click: text=查看长列表
+
+  # ---- 首页静态文案（$r 直引 / resourceManager / %d 格式化） ----
+  home:
+    keys: [main_title, rm_hello, remaining_count, nav_settings, nav_list, nav_state]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=首页
+
+  # ---- 设置页静态文案 ----
+  settings:
+    keys: [settings_title, settings_about, dialog_button, toast_button, back_home]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=打开设置页
+      - click: text=打开设置页

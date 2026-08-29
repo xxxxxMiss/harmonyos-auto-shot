@@ -1,0 +1,23 @@
+# 场景注册表示例：key -> 到达页面的操作步骤
+# 步骤语法见 autoshot/navigator.py 模块注释
+# conditions 为二期故障注入预留（如 network: broken_proxy 触发断网错误提示）
+
+default:
+  steps:
+    - launch: com.example.sampleapp
+
+scenes:
+  settings:
+    keys: [settings_title, settings_about, network_error]
+    steps:
+      - launch: com.example.sampleapp
+      - expect: text=首页
+      - click: text=设置
+    conditions:
+      network_error: broken   # network_error 这个 key 需要 network=broken 条件（二期实现注入）
+
+  home:
+    keys: [main_title, login_button, remaining_count]
+    steps:
+      - launch: com.example.sampleapp
+      - expect: text=首页

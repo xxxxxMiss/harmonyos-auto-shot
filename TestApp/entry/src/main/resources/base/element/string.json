@@ -1,0 +1,28 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "AutoShot截图验证工程" },
+    { "name": "EntryAbility_desc", "value": "AutoShot截图验证工程" },
+    { "name": "EntryAbility_label", "value": "AutoShot演示" },
+    { "name": "main_title", "value": "首页" },
+    { "name": "nav_settings", "value": "打开设置页" },
+    { "name": "nav_list", "value": "查看长列表" },
+    { "name": "nav_state", "value": "状态演示页" },
+    { "name": "rm_hello", "value": "你好，资源管理器" },
+    { "name": "remaining_count", "value": "还剩%d项" },
+    { "name": "settings_title", "value": "设置" },
+    { "name": "settings_about", "value": "关于本应用" },
+    { "name": "dialog_button", "value": "显示弹窗" },
+    { "name": "dialog_message", "value": "这是一个弹窗内容示例" },
+    { "name": "toast_button", "value": "显示Toast" },
+    { "name": "toast_message", "value": "这是一条Toast提示" },
+    { "name": "back_home", "value": "返回首页" },
+    { "name": "list_title", "value": "长列表页" },
+    { "name": "list_target", "value": "藏在深处的目标项" },
+    { "name": "state_title", "value": "状态演示页" },
+    { "name": "toggle_offline", "value": "模拟断网" },
+    { "name": "toggle_empty", "value": "切换空列表" },
+    { "name": "network_error", "value": "网络连接不可用，请检查网络设置" },
+    { "name": "empty_list", "value": "列表为空" },
+    { "name": "unused_string", "value": "没有任何页面引用我" }
+  ]
+}
