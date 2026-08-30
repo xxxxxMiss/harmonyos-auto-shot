@@ -42,6 +42,11 @@ struct Index {
         .onClick(() => {
           router.pushUrl({ url: 'pages/StatePage' })
         })
+      Button($r('app.string.nav_entry'))
+        .width('80%')
+        .onClick(() => {
+          router.pushUrl({ url: 'pages/NavEntryPage' })
+        })
     }
     .width('100%')
     .height('100%')

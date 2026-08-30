@@ -14,11 +14,20 @@ npm install                                   # 阶段二 AST 后端依赖（typ
 
 ## 静态扫描性能
 
-`tools/ast_scan.mjs` 是 AST 扫描内核（Node + TypeScript Compiler API）。1001 文件 / 4.5 万行
-基准（`node tools/gen_bench_fixture.mjs /tmp/bench 1000` 生成）：
+`tools/ast_scan.mjs` 是 AST 扫描内核（TypeScript Compiler API）。
+
+**typescript 双模式（`tools/ts_loader.mjs`）**：
+- 默认优先加载 **鸿蒙官方 fork 的 TypeScript**（DevEco SDK 内 `ets-loader/node_modules/typescript`，
+  版本 `4.9.5-r4`），原生支持 ArkTS 的 `struct` 关键字（`SyntaxKind.StructDeclaration`），
+  parse 错误从官方 TS 的 110 个降到 40 个（剩余是 `$r` 资源引用，AST 完整保留）。
+- 找不到 SDK 时回退项目 node_modules 的**官方 TypeScript** + `struct→class` 预处理。
+- `AUTOSHOT_TS=official` 可强制走官方模式（CI 无 DevEco 环境）。
+- 实测：两种模式对 TestApp 扫描输出**逐项一致**（41 usages / 10 edges / 9 pages）。
+
+1001 文件 / 4.5 万行基准（`node tools/gen_bench_fixture.mjs /tmp/bench 1000` 生成）：
 
 - 优化前 ~0.87s，优化后 ~0.75s；其中 `preprocess`（struct→class）由逐字符状态机改为
-  "掩码保护+正则替换"，单步 220ms → 12ms（18×）。
+  "掩码保护+正则替换"，单步 220ms → 12ms（18×）。fork 模式下无需 preprocess。
 - 剩余耗时大头是 TS 解析本身（每文件独立 `ts.createSourceFile`，~0.4s/千文件），
   属 Compiler API 固有成本；遍历+规则匹配仅 ~40ms（非瓶颈）。
 - 已做：`resolveImport` 结果缓存、`matchAccessor` Map 索引、R5 主遍历廉价预判、
@@ -123,6 +132,8 @@ dismiss_texts: ["我知道了", "暂不升级"]  # 自动点掉的打扰弹窗
 | `pages/SettingsPage` | 点击触发 AlertDialog / Toast（瞬态 UI） |
 | `pages/ListPage` | 30 项长列表，第 21 项为目标文案（懒加载滚动定位） |
 | `pages/StatePage` | 条件渲染：断网错误提示 / 空列表态（需点击触发） |
+| `pages/DetailPage` | router 方案：同路由不同参数（手写场景兜底） |
+| `pages/NavEntryPage` + `route_map.json` | **NavDestination 方案**：同路由不同参数（自动推导）+ 不同条件进不同路由（手写兜底） |
 
 构建与安装（macOS，DevEco Studio 6.x）：
 
@@ -156,19 +167,39 @@ hdc install -r entry/build/default/outputs/default/entry-default-signed.hap
 
 ## 已知边界
 
+- **NavDestination（route_map.json 方案，已支持）**：`discoverPages` 已解析
+  module.json5 的 `routerMap` 字段（route_map.json 的 name/pageSourceFile）；导航边提取
+  支持 `NavPathStack.pushPathByName('X', param)` / `pushPath`，param 支持对象字面量
+  （含 `as` 类型断言剥离）+ 一层变量追踪。
+  - **同路由不同参数（自动推导 ✓）**：`if (this.index === 2)` + 边 param `{index: idx}` +
+    列表项模板串 `` `详情项${idx}` `` → 自动推导"点详情项2"。真机验证 nav_detail_0/1/2 均成功。
+  - **不同条件进不同路由（自动推导 ✓）**：`if (type === 'A') push A else push B`，结合
+    ForEach 数据源 `this.routes = ['A','B','A','B']` 枚举出满足条件的列表项文案
+    （routeCond + forEach 上下文 + viaItems）。真机验证 nav_route_a/b 均成功，无需手写。
+  - **谓词求值器（`tools/predicate_eval.mjs`）**：条件路由判定从正则匹配升级为抽象解释，
+    支持同步可求值的条件形态——等值/比较/逻辑运算、返回布尔值的函数（**多语句函数体**：
+    if/else、多 return、局部变量、有界 for 循环）、数据源为**函数返回数组**
+    （含 `arr.push()` 构造）、**跨文件 import** 的函数定位、列表项为**对象数组**
+    （`item.kind` 成员访问）。超出子集的（递归/无界循环/真实异步数据）→ 回退手写 scenes.yaml。
+- **同路由不同参数（旧 router 方案）**：`router.pushUrl({url, params})` 只记录 url 不记录
+  params，且列表项三元表达式提取不到触发标签；这类 key 需手写 scenes.yaml
+  （见 `detail_*` 场景，`tests/test_same_route_diff_params.py`）。
 - **静态扫描（阶段二 ast 后端已就绪）**：R4 常量传播（1 层间接 + 跨文件 import）、R5 函数摘要
   （识别"以参数转发调用 resourceManager 按名 API"的封装并回溯调用点）、上下文分类
-  （visible/conditional[含条件源码]/click/runtime）、导航图（module.json5 pages + pushUrl/
-  pushPathByName 边 + import 归属 + BFS 深度）均已实现。残余边界：R6 动态查表
+  （visible/conditional[含条件源码]/click/runtime）、导航图（module.json5 pages + routerMap +
+  pushUrl/pushPathByName 边 + import 归属 + BFS 深度）均已实现。残余边界：R6 动态查表
   （`MAP[变量]`）仍标记 dynamic 需人工/LLM 兜底；`$r` 引用跨 `.hsp/.har` 的归属用文件路径近似。
 - **自动场景（阶段三）**：导航边/弹窗/状态开关的触发标签由 onClick 回调向上爬取，能覆盖
-  `Button($r(...)).width(...).onClick(...)` 与 `if (this.x)` 开关两种典型形态；按钮标签由变量
-  动态拼接、多态路由、跨 `.hsp/.har` 边仍可能推导不出，会产出 `_needs_manual_nav` 标记或
-  跳过，需手写 scenes.yaml 兜底（手写优先于自动）。
+  `Button($r(...)).width(...).onClick(...)`、`if (this.x)` 开关、`if (type === 'A')` 条件路由
+  （ForEach 数据枚举）三种形态；按钮标签由变量动态拼接、服务端配置的路由、跨 `.hsp/.har`
+  边仍可能推导不出，会产出 `_needs_manual_nav` 标记或跳过，需手写 scenes.yaml 兜底
+  （手写优先于自动）。
 - **条件 UI（断网提示等）**：MVP 靠 UI 上的"模拟断网"开关按钮点击（状态开关步道）；
   真实网络故障注入（代理 L2）与白盒状态注入（L3）为后续阶段。
 - **设备侧命令兼容性**：已在 HarmonyOS 6.1 真机验证（见上方实测结论）；其他系统版本
   若 `uitest dumpLayout/screenCap` 报错，优先核对参数差异。
-- 本机若装的是 HMS Core 附带的 hdc，连接 NEXT 设备可用；如遇异常改用 DevEco
-  Command Line Tools 的版本（`--hdc-path` 指定）。
+- **hdc 版本**：PATH 里的 HMS Core 附带的旧版 hdc（1.2.0a）在 hidumper 时报
+  "sdk hdc.exe version is too low"，无法获取屏幕分辨率。需用 DevEco 自带的新版
+  （3.2.0c，`/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc`），
+  通过 `--hdc-path` 或工程根的 `autoshot.yaml` 的 `hdc_path` 指定（TestApp 已配置）。
 - 隐私页禁止截屏（SECURE）会得到黑图，驱动会显式报错。

@@ -54,6 +54,31 @@ scenes:
       - launch: com.example.hualitd
       - expect: text=首页
 
+  # ---- 同路由不同参数：DetailPage 按 index 渲染不同内容 ----
+  # detail_0~4 的显示依赖路由参数 index，自动推导无法带参跳转，需手写：
+  # 进长列表 → 点对应索引的列表项（列表项文本是三元表达式，也需按文案定位）
+  detail_0_scene:
+    keys: [detail_0]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=查看长列表
+      - click: text=查看长列表
+      - click: text=列表第1项
+  detail_2_scene:
+    keys: [detail_2]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=查看长列表
+      - click: text=查看长列表
+      - click: text=列表第3项
+  detail_default_scene:
+    keys: [detail_default]
+    steps:
+      - launch: com.example.hualitd
+      - expect: text=查看长列表
+      - click: text=查看长列表
+      - click: text=列表第6项
+
   # ---- 设置页静态文案 ----
   settings:
     keys: [settings_title, settings_about, dialog_button, toast_button, back_home]
@@ -61,3 +86,4 @@ scenes:
       - launch: com.example.hualitd
       - expect: text=打开设置页
       - click: text=打开设置页
+

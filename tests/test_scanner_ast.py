@@ -90,7 +90,9 @@ def test_usage_index_payload_has_pages_and_triggers(index, scan):
 def _testapp_scan():
     scan = scan_project(TESTAPP, backend="ast")
     pages = {p["name"]: p["depth"] for p in scan.pages}
-    assert pages == {"pages/Index": 0, "pages/SettingsPage": 1, "pages/ListPage": 1, "pages/StatePage": 1}
+    assert pages == {"pages/Index": 0, "pages/SettingsPage": 1, "pages/ListPage": 1,
+                     "pages/StatePage": 1, "pages/DetailPage": 2, "pages/NavEntryPage": 1,
+                     "NavDetailPage": 2, "NavRouteAPage": 2, "NavRouteBPage": 2}
     return scan
 
 
@@ -104,7 +106,8 @@ def test_testapp_key_pages():
 def test_testapp_push_url_edges():
     scan = _testapp_scan()
     targets = {e["to"] for e in scan.edges if e["api"] == "pushUrl"}
-    assert targets == {"pages/SettingsPage", "pages/ListPage", "pages/StatePage"}
+    assert targets == {"pages/SettingsPage", "pages/ListPage", "pages/StatePage",
+                       "pages/DetailPage", "pages/NavEntryPage"}
 
 
 def test_testapp_conditional_and_click():

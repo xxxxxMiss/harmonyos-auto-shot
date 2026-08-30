@@ -3,6 +3,8 @@
     "pages/Index",
     "pages/SettingsPage",
     "pages/ListPage",
-    "pages/StatePage"
+    "pages/StatePage",
+    "pages/DetailPage",
+    "pages/NavEntryPage"
   ]
 }

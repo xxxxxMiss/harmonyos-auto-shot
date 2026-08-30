@@ -13,6 +13,17 @@ shots/
 batch_shots/
 cap_shots/
 demo_shots/
+detail_shots/
+nav_shots/
+nav_shots2/
+nav_shots3/
+nav_shots4/
+nav_final/
+nav_verify/
+nav_ts/
+
+# ---- IDE ----
+.idea/
 
 # ---- 临时输出 ----
 usage_index.json

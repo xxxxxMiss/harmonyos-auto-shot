@@ -10,12 +10,18 @@
  * 用法：node tools/ast_scan.mjs <projectRoot> [outJsonPath]
  * 输出：JSON（stdout 或 --out 文件），由 Python 侧 autoshot/scanner.py 调用合并。
  */
-import ts from 'typescript';
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
+import { evaluateRouteItems } from './predicate_eval.mjs';
+import { loadTypescript, needsStructPreprocess, typescriptSource } from './ts_loader.mjs';
+const ts = loadTypescript().ts;
 
 const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href;
+
+// struct（ArkTS/fork TS 原生）或 class（官方 TS + preprocess）统一视为"结构体声明"
+const isStructLike = (node) =>
+  ts.isClassDeclaration(node) || (ts.isStructDeclaration && ts.isStructDeclaration(node));
 
 const PRUNE = new Set(['oh_modules', 'node_modules', 'build', '.hvigor', '.preview',
   '.cxx', '.idea', '.git', 'dist', '.test', 'entry/build']);
@@ -64,12 +70,14 @@ function collectSourceFiles(root) {
 }
 
 function discoverPages(root) {
-  const pages = []; // {name:'pages/Index', file:'entry/src/main/ets/pages/Index.ets', module}
+  const pages = []; // {name:'pages/Index' 或 'DetailPage', file:'entry/src/main/ets/pages/X.ets', module, via:'pages'|'routerMap'}
   const bp = readJsonLoose(path.join(root, 'build-profile.json5')) || {};
   for (const mod of bp.app?.modules || bp.modules || []) {
     const srcPath = mod.srcPath || mod.srcpath; if (!srcPath) continue;
     const base = path.join(root, srcPath, 'src', 'main');
     const moduleJson = readJsonLoose(path.join(base, 'module.json5')); if (!moduleJson) continue;
+
+    // 1) 传统 router 方案：module.json5.pages -> main_pages.json（name 形如 'pages/Index'）
     const pagesRef = moduleJson.module?.pages; // "$profile:main_pages" 或数组
     let pageSrcs = [];
     if (typeof pagesRef === 'string' && pagesRef.startsWith('$profile:')) {
@@ -78,7 +86,22 @@ function discoverPages(root) {
     } else if (Array.isArray(pagesRef)) pageSrcs = pagesRef;
     for (const s of pageSrcs) {
       const f = path.join(base, 'ets', s + '.ets');
-      pages.push({ name: s, file: rel(root, f), module: mod.name || path.basename(srcPath), exists: fs.existsSync(f) });
+      pages.push({ name: s, file: rel(root, f), module: mod.name || path.basename(srcPath), exists: fs.existsSync(f), via: 'pages' });
+    }
+
+    // 2) NavDestination 方案：module.json5.routerMap -> route_map.json
+    //    routerMap 条目 name 为路由名（如 'DetailPage'，不带 pages/ 前缀），
+    //    pageSourceFile 为相对模块根路径（如 'src/main/ets/pages/DetailPage.ets'）。
+    const routerMapRef = moduleJson.module?.routerMap; // "$profile:route_map"
+    if (typeof routerMapRef === 'string' && routerMapRef.startsWith('$profile:')) {
+      const rm = readJsonLoose(path.join(base, 'resources', 'base', 'profile', routerMapRef.slice('$profile:'.length) + '.json'));
+      const entries = rm?.routerMap || [];
+      for (const e of entries) {
+        const name = e?.name; const psf = e?.pageSourceFile;
+        if (!name || !psf) continue;
+        const f = path.join(root, srcPath, psf);
+        pages.push({ name, file: rel(root, f), module: mod.name || path.basename(srcPath), exists: fs.existsSync(f), via: 'routerMap' });
+      }
     }
   }
   return pages;
@@ -89,8 +112,11 @@ export function analyzeFile(root, filePath, sourceFile) {
   const rec = {
     file: rel(root, filePath),
     consts: new Map(),        // name -> string 字面量
-    constObjs: new Map(),     // name -> Map(key -> string)
-    classes: new Map(),       // className -> {decorators, props: Map(prop->string), methods: Set}
+    constObjs: new Map(),     // name -> Map(key -> string 字面量)
+    constObjExprs: new Map(), // name -> Map(key -> 表达式文本)；用于参数一层变量追踪
+    constArrays: new Map(),   // name -> ArrayLiteralExpression（顶层 const 数组，节点引用）
+    constFns: new Map(),      // name -> ArrowFunction（顶层 const 箭头函数，节点引用）
+    classes: new Map(),       // className -> {decorators, props, arrayProps, methods}
     functions: new Map(),     // funcName -> node
     imports: new Map(),       // localName -> {spec, imported}
     exports: new Set(),
@@ -114,22 +140,34 @@ export function analyzeFile(root, filePath, sourceFile) {
         if (ts.isIdentifier(d.name) && d.initializer) {
           if (ts.isStringLiteral(d.initializer)) rec.consts.set(d.name.text, d.initializer.text);
           else if (ts.isObjectLiteralExpression(d.initializer)) {
-            const m = new Map();
+            const m = new Map();       // string 字面量值（供 R6 查表）
+            const em = new Map();      // 表达式文本（供参数一层变量追踪）
             for (const p of d.initializer.properties) {
-              if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && ts.isStringLiteral(p.initializer))
-                m.set(p.name.text, p.initializer.text);
+              if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) {
+                if (ts.isStringLiteral(p.initializer)) m.set(p.name.text, p.initializer.text);
+                em.set(p.name.text, p.initializer.getText(sourceFile));
+              }
             }
             rec.constObjs.set(d.name.text, m);
+            rec.constObjExprs.set(d.name.text, em);
+          }
+          else if (ts.isArrayLiteralExpression(d.initializer)) {
+            rec.constArrays.set(d.name.text, d.initializer);   // 存节点，求值器统一处理
+          }
+          else if (ts.isArrowFunction(d.initializer)) {
+            rec.constFns.set(d.name.text, d.initializer);      // const isTypeA = (x) => {...}
           }
         }
       }
     }
-    if (ts.isClassDeclaration(node) && node.name) {
-      const cls = { decorators: node.modifiers?.filter(ts.isDecorator).map(d => d.getText(sourceFile)) || [], props: new Map(), methods: new Set() };
+    if (isStructLike(node) && node.name) {
+      const cls = { decorators: node.modifiers?.filter(ts.isDecorator).map(d => d.getText(sourceFile)) || [], props: new Map(), arrayProps: new Map(), methods: new Map() };
       for (const m of node.members) {
-        if (ts.isPropertyDeclaration(m) && ts.isIdentifier(m.name) && m.initializer && ts.isStringLiteral(m.initializer))
-          cls.props.set(m.name.text, m.initializer.text);
-        if (ts.isMethodDeclaration(m) && m.name) cls.methods.add(m.name.getText(sourceFile));
+        if (ts.isPropertyDeclaration(m) && ts.isIdentifier(m.name) && m.initializer) {
+          if (ts.isStringLiteral(m.initializer)) cls.props.set(m.name.text, m.initializer.text);
+          else if (ts.isArrayLiteralExpression(m.initializer)) cls.arrayProps.set(m.name.text, m.initializer);
+        }
+        if (ts.isMethodDeclaration(m) && m.name) cls.methods.set(m.name.getText(sourceFile), m);
       }
       rec.classes.set(node.name.text, cls);
       if (node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) rec.exports.add(node.name.text);
@@ -164,7 +202,7 @@ function resolveString(expr, fileRec, currentClass, fileIndex, root, depth = 0) 
     }
     return null;
   }
-  if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression) && expr.expression.text === 'this') {
+  if (ts.isPropertyAccessExpression(expr) && expr.expression.kind === ts.SyntaxKind.ThisKeyword) {
     return fileRec.classes.get(currentClass)?.props.get(expr.name.text) ?? null;
   }
   // constObj.key / constObj[idx]（R6 查表：key 已知才可解析，动态 idx 返回 null）
@@ -226,7 +264,7 @@ export function findAccessors(sourceFile, fileRec) {
   for (const [clsName, cls] of fileRec.classes) {
     // 类方法在顶层 collect 时未存 node，这里重扫一遍 class
     for (const st of sourceFile.statements) {
-      if (ts.isClassDeclaration(st) && st.name?.text === clsName) {
+      if (isStructLike(st) && st.name?.text === clsName) {
         for (const m of st.members) {
           if (ts.isMethodDeclaration(m) && m.name)
             checkFn(m.name.getText(sourceFile), clsName, m.parameters, m.body);
@@ -262,7 +300,7 @@ function classify(sourceFile, node, currentClass, currentFn) {
         if (['catch', 'then', 'finally'].includes(p.expression.name.text) && !tags.includes('runtime')) tags.push('runtime');
       }
     }
-    if (ts.isClassDeclaration(p) && p.name) {
+    if (isStructLike(p) && p.name) {
       const decos = p.modifiers?.filter(ts.isDecorator).map(d => d.getText(sourceFile)).join(' ') || '';
       if (decos.includes('CustomDialog') && !tags.includes('click')) tags.push('click');
       cls = p.name.text;
@@ -287,6 +325,23 @@ function labelOfArg(arg0) {
     if (ts.isStringLiteral(r)) { const m = /^app\.string\.([A-Za-z_][\w]*)$/.exec(r.text); if (m) return { viaKey: m[1] }; }
   }
   if (ts.isStringLiteral(arg0)) return { viaText: arg0.text };
+  // 无变量模板串：纯文案
+  if (ts.isNoSubstitutionTemplateLiteral(arg0)) return { viaText: arg0.text };
+  if (ts.isTemplateExpression(arg0)) {
+    // 多变量模板：`路由项${type}${idx}` / `高级项${item.kind}${idx}`
+    // viaVars 存各 span 的表达式文本（Identifier 或成员访问 item.kind），
+    // 由谓词求值器在 ForEach 参数环境中逐个求值。
+    const parts = { prefix: arg0.head.text, vars: [] };
+    for (const span of arg0.templateSpans) {
+      const e = span.expression;
+      if (ts.isIdentifier(e) || ts.isPropertyAccessExpression(e)) {
+        parts.vars.push(e.getText().replace(/\s+/g, ''));
+      } else {
+        return { viaTemplate: arg0.head.text, viaVar: null };   // 复杂表达式 → 只留前缀
+      }
+    }
+    return { viaTemplate: parts.prefix, viaVars: parts.vars, viaVar: parts.vars.length === 1 ? parts.vars[0] : null };
+  }
   return null;
 }
 
@@ -295,7 +350,7 @@ export function climbTriggerLabel(node, sourceFile) {
   let p = node.parent, arrow = null;
   while (p) {
     if (ts.isArrowFunction(p) || ts.isFunctionExpression(p)) { arrow = p; break; }
-    if (ts.isClassDeclaration(p) || ts.isSourceFile(p)) return null;
+    if (isStructLike(p) || ts.isSourceFile(p)) return null;
     p = p.parent;
   }
   if (!arrow) return null;
@@ -313,6 +368,87 @@ export function climbTriggerLabel(node, sourceFile) {
   return null;
 }
 
+// ---------- 路由参数解析（NavPathStack.pushPathByName/pushPath 的 param） ----------
+// 返回 { literal: {key: exprText} }（对象字面量，或一层变量追踪到 const 对象字面量）
+// 或 { varName }（参数是变量但追踪不到字面量）或 null（无法解析）。
+function extractParam(arg, fileRec) {
+  if (!arg) return null;
+  // 剥掉 as 类型断言：{ index: idx } as NavDetailParam
+  if (ts.isAsExpression(arg)) arg = arg.expression;
+  if (ts.isTypeAssertionExpression(arg)) arg = arg.expression;
+  if (ts.isObjectLiteralExpression(arg)) {
+    const literal = {};
+    for (const p of arg.properties) {
+      if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) {
+        literal[p.name.text] = p.initializer.getText();
+      }
+    }
+    return { literal };
+  }
+  if (ts.isIdentifier(arg)) {
+    // 一层变量追踪：const p = {index: idx}; pushByName('X', p)
+    const em = fileRec.constObjExprs?.get(arg.text);
+    if (em) {
+      const literal = {};
+      for (const [k, v] of em) literal[k] = v;
+      return { literal };
+    }
+    return { varName: arg.text };
+  }
+  if (ts.isPropertyAccessExpression(arg)) {
+    return { varName: arg.getText() };
+  }
+  return null;
+}
+
+// ---------- 条件路由识别：if (var === 'X') pushPathByName('RouteA') ----------
+// 从 pushPathByName/pushPath 调用向上找到包裹它的 if 条件，返回 { varName, value, negated }
+// 例：if (type === 'A') push('A') → { condition, inElse }
+//     if (isTypeA(item)) push('A') → { condition: isTypeA(item), inElse }
+// 返回 if 的条件表达式 AST + 调用是否在 else 分支；求值交给 predicate_eval。
+function routeConditionOf(node, sourceFile) {
+  let p = node.parent;
+  while (p) {
+    if (ts.isIfStatement(p)) {
+      const inElse = !!p.elseStatement && isDescendantOf(node, p.elseStatement);
+      return { condition: p.expression, inElse, ifNode: p };
+    }
+    if (ts.isArrowFunction(p) || ts.isFunctionExpression(p) || isStructLike(p) || ts.isSourceFile(p)) break;
+    p = p.parent;
+  }
+  return null;
+}
+
+// 判断 node 是否是 ancestor 的后代
+function isDescendantOf(node, ancestor) {
+  if (!ancestor) return false;
+  let p = node.parent;
+  while (p) {
+    if (p === ancestor) return true;
+    p = p.parent;
+  }
+  return false;
+}
+
+// 解析 ForEach 数据源：ForEach(this.routes, (type, idx) => ...) → { sourceNode, sourceExpr, paramNames }
+function forEachContextOf(arrowOrNode, sourceFile) {
+  // 从某个节点向上找 ForEach 调用，提取数据源与回调参数名
+  let p = arrowOrNode;
+  while (p) {
+    if (ts.isCallExpression(p) && ts.isIdentifier(p.expression) && p.expression.text === 'ForEach') {
+      const args = p.arguments;
+      if (args.length >= 2 && (ts.isArrowFunction(args[1]) || ts.isFunctionExpression(args[1]))) {
+        const cb = args[1];
+        const paramNames = cb.parameters.map(pp => ts.isIdentifier(pp.name) ? pp.name.text : null).filter(Boolean);
+        return { sourceNode: args[0], sourceExpr: args[0].getText(sourceFile).replace(/\s+/g, ''), paramNames };
+      }
+    }
+    if (isStructLike(p) || ts.isSourceFile(p)) break;
+    p = p.parent;
+  }
+  return null;
+}
+
 // ---------- 主流程 ----------
 function main() {
   const root = process.argv[2]; if (!root || !fs.existsSync(root)) fail('工程根不存在: ' + root);
@@ -322,9 +458,10 @@ function main() {
   const pageByFile = new Map(pages.filter(p => p.exists).map(p => [p.file, p.name]));
 
   const parsed = [];
+  const doPreprocess = needsStructPreprocess();   // fork 版原生支持 struct，无需预处理
   for (const f of files) {
     const raw = readText(f); if (raw == null) continue;
-    const src = ts.createSourceFile(f, preprocess(raw), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const src = ts.createSourceFile(f, doPreprocess ? preprocess(raw) : raw, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     const rec = analyzeFile(root, f, src);
     parsed.push({ abs: f, src, rec });
   }
@@ -375,14 +512,14 @@ function main() {
     let currentClass = null, currentFn = null;
     const classStack = [], fnStack = [];
     const enter = (node) => {
-      if (ts.isClassDeclaration(node) && node.name) { currentClass = node.name.text; classStack.push(currentClass); }
+      if (isStructLike(node) && node.name) { currentClass = node.name.text; classStack.push(currentClass); }
       if ((ts.isMethodDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isArrowFunction(node)) ) {
         currentFn = node.name ? node.name.getText(src) : (ts.isArrowFunction(node) && ts.isVariableDeclaration(node.parent) ? node.parent.name.getText(src) : currentFn);
         fnStack.push(currentFn);
       }
     };
     const exit = (node) => {
-      if (ts.isClassDeclaration(node)) { classStack.pop(); currentClass = classStack[classStack.length - 1] ?? null; }
+      if (isStructLike(node)) { classStack.pop(); currentClass = classStack[classStack.length - 1] ?? null; }
       if (ts.isMethodDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isArrowFunction(node)) { fnStack.pop(); currentFn = fnStack[fnStack.length - 1] ?? null; }
     };
     const pushUsage = (node, key, rule) => {
@@ -464,21 +601,46 @@ function main() {
             for (const v of new Set(vars)) toggles.push({ file: rec.file, varName: v, viaKey: label?.viaKey ?? null, viaText: label?.viaText ?? null });
           }
         }
-        // 导航边：router.pushUrl/replaceUrl({url:'pages/X'})、pushPathByName('X')
+        // 导航边：router.pushUrl/replaceUrl({url:'pages/X'})、NavPathStack.pushPathByName/pushPath
         const apiName = calleeProp || calleeId || '';
         if (['pushUrl', 'replaceUrl'].includes(apiName) && args.length > 0 && ts.isObjectLiteralExpression(args[0])) {
           const via = climbTriggerLabel(node, src);
           for (const prop of args[0].properties) {
             if (ts.isPropertyAssignment(prop) && prop.name.getText(src) === 'url' && ts.isStringLiteral(prop.initializer)) {
               edges.push({ from: rec.file, to: prop.initializer.text, api: apiName,
-                viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null });
+                viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null, param: null });
             }
           }
         }
+        // pushPathByName('Name'[, param])：NavDestination 系统路由表方案，name 为路由名
         if (apiName === 'pushPathByName' && args.length > 0 && ts.isStringLiteral(args[0])) {
           const via = climbTriggerLabel(node, src);
+          const param = extractParam(args[1], rec);
+          const routeCond = routeConditionOf(node, src);
+          const fe = routeCond ? forEachContextOf(node, src) : null;
           edges.push({ from: rec.file, to: args[0].text, api: 'pushPathByName',
-            viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null });
+            viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null,
+            viaTemplate: via?.viaTemplate ?? null, viaVar: via?.viaVar ?? null,
+            viaVars: via?.viaVars ?? null,
+            param, routeCond, forEach: fe, struct: currentClass });
+        }
+        // pushPath({name:'Name', param:{...}}) 或 pushPath('Name', param)：兼容两种形态
+        if (apiName === 'pushPath' && args.length > 0) {
+          const via = climbTriggerLabel(node, src);
+          let to = null, param = null;
+          if (ts.isObjectLiteralExpression(args[0])) {
+            for (const prop of args[0].properties) {
+              if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === 'name'
+                  && ts.isStringLiteral(prop.initializer)) to = prop.initializer.text;
+              if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === 'param') {
+                param = extractParam(prop.initializer, rec);
+              }
+            }
+          } else if (ts.isStringLiteral(args[0])) {
+            to = args[0].text; param = extractParam(args[1], rec);
+          }
+          if (to) edges.push({ from: rec.file, to, api: 'pushPath',
+            viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null, param });
         }
       }
       ts.forEachChild(node, walk);
@@ -553,7 +715,7 @@ function main() {
     keyPages[key] = [...s].map(pg => ({ page: pg, depth: depth.has(pg) ? depth.get(pg) : null })).sort((a, b) => (a.depth ?? 99) - (b.depth ?? 99));
   }
 
-  // ---- 触发信息富集（弹窗触发按钮 / 条件变量对应的开关按钮）----
+  // ---- 触发信息富集（弹窗触发按钮 / 条件变量对应的开关按钮 / 路由参数条件）----
   for (const u of usages) {
     if (u._dialogNode && u._src) {
       const label = climbTriggerLabel(u._dialogNode, u._src);
@@ -565,11 +727,37 @@ function main() {
         const t = toggles.find(t => t.file === u.file && t.varName === v);
         if (t) { u.toggleVar = v; u.toggleViaKey = t.viaKey; u.toggleViaText = t.viaText; break; }
       }
+      // 路由参数条件：if (this.index === N) —— 记录 paramVar 与 paramValue，
+      // 供自动场景生成时结合导航边的 param 推导"点击哪个列表项带这个参数"。
+      const pm = /this\.([A-Za-z_]\w*)\s*===?\s*(-?\d+)/.exec(u.conditionText);
+      if (pm) { u.paramVar = pm[1]; u.paramValue = pm[2]; }
     }
     delete u._src; delete u._dialogNode;
   }
 
-  // ---- 页面级邻接表（含触发标签，供自动场景生成 BFS 用）----
+  // ---- 条件路由 → 点击文案枚举（不同条件进不同路由）----
+  // 对每条含 routeCond 的边，用谓词求值器对 ForEach 数据源逐项求值，
+  // 解析出"点哪个列表项能进这个路由"。
+  // 链路：if 条件（含函数调用）+ ForEach 数据源 + 列表项文案模板 + 边 viaVars。
+  for (const e of edges) {
+    const rc = e.routeCond, fe = e.forEach;
+    if (!rc || !fe || !e.viaVars) continue;
+    const evalCtx = {
+      file: e.from, cls: e.struct, root,
+      fileIndex, resolveImport,
+    };
+    const items = evaluateRouteItems({
+      conditionNode: rc.condition,
+      sourceNode: fe.sourceNode,
+      paramNames: fe.paramNames,
+      inElse: rc.inElse,
+      viaTemplate: e.viaTemplate,
+      viaVars: e.viaVars,
+    }, evalCtx);
+    if (items) e.viaItems = items;
+  }
+
+  // ---- 页面级邻接表（含触发标签 + 路由参数 + 条件路由点击文案，供自动场景生成 BFS 用）----
   const pageAdj = {};
   {
     const pageOfFile = new Map(pages.filter(p => p.exists).map(p => [p.file, p.name]));
@@ -577,17 +765,34 @@ function main() {
       if (!pages.some(p => p.name === e.to)) continue;
       const srcPages = pageOfFile.has(e.from) ? [pageOfFile.get(e.from)] : owningPages(e.from);
       for (const sp of srcPages) {
-        (pageAdj[sp] = pageAdj[sp] || []).push({ to: e.to, viaKey: e.viaKey ?? null, viaText: e.viaText ?? null });
+        (pageAdj[sp] = pageAdj[sp] || []).push({
+          to: e.to, viaKey: e.viaKey ?? null, viaText: e.viaText ?? null,
+          viaTemplate: e.viaTemplate ?? null, viaVar: e.viaVar ?? null,
+          viaItems: e.viaItems ?? null,
+          param: e.param ?? null,
+        });
       }
     }
   }
+
+  // 清理 edges 里的 AST 节点（求值已用完），避免 JSON 循环引用；
+  // 保留 routeCond 的文本摘要（condition 源码 + inElse）供调试/测试。
+  const cleanEdges = edges.map(e => {
+    const c = { ...e };
+    if (c.routeCond) {
+      c.routeCond = { conditionText: c.routeCond.condition.getText(), inElse: c.routeCond.inElse };
+    }
+    delete c.forEach;       // 内含 sourceNode AST 节点
+    delete c.struct;        // 仅求值用
+    return c;
+  });
 
   const result = {
     backend: 'ast', projectRoot: path.resolve(root), files: parsed.length,
     usages, dynamicRefs,
     accessors: accessors.map(a => ({ name: a.name, className: a.className, paramIndex: a.paramIndex, file: a.file })),
-    pages: pages.map(p => ({ name: p.name, file: p.file, exists: p.exists, depth: depth.has(p.name) ? depth.get(p.name) : null })),
-    edges, keyPages, pageAdj, toggles,
+    pages: pages.map(p => ({ name: p.name, file: p.file, exists: p.exists, depth: depth.has(p.name) ? depth.get(p.name) : null, via: p.via ?? null })),
+    edges: cleanEdges, keyPages, pageAdj, toggles,
   };
   const json = JSON.stringify(result, null, 1);
   if (outPath) fs.writeFileSync(outPath, json); else process.stdout.write(json);

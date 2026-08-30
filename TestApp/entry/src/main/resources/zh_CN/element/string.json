@@ -23,6 +23,22 @@
     { "name": "toggle_empty", "value": "切换空列表" },
     { "name": "network_error", "value": "网络连接不可用，请检查网络设置" },
     { "name": "empty_list", "value": "列表为空" },
+    { "name": "detail_title", "value": "详情页" },
+    { "name": "detail_0", "value": "这是索引0的内容" },
+    { "name": "detail_1", "value": "这是索引1的内容" },
+    { "name": "detail_2", "value": "这是索引2的内容" },
+    { "name": "detail_3", "value": "这是索引3的内容" },
+    { "name": "detail_4", "value": "这是索引4的内容" },
+    { "name": "detail_default", "value": "未知索引的默认内容" },
+    { "name": "nav_detail_title", "value": "导航详情页" },
+    { "name": "nav_detail_0", "value": "参数为0的内容" },
+    { "name": "nav_detail_1", "value": "参数为1的内容" },
+    { "name": "nav_detail_2", "value": "参数为2的内容" },
+    { "name": "nav_route_a", "value": "进入了路由A" },
+    { "name": "nav_route_b", "value": "进入了路由B" },
+    { "name": "nav_entry", "value": "导航入口" },
+    { "name": "nav_entry_title", "value": "导航入口页" },
+    { "name": "nav_entry_hint", "value": "点击下方列表项" },
     { "name": "unused_string", "value": "没有任何页面引用我" }
   ]
 }

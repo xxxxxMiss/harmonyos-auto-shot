@@ -23,6 +23,22 @@
     { "name": "toggle_empty", "value": "Toggle empty list" },
     { "name": "network_error", "value": "Network unavailable, check your settings" },
     { "name": "empty_list", "value": "The list is empty" },
+    { "name": "detail_title", "value": "Detail Page" },
+    { "name": "detail_0", "value": "Content for index 0" },
+    { "name": "detail_1", "value": "Content for index 1" },
+    { "name": "detail_2", "value": "Content for index 2" },
+    { "name": "detail_3", "value": "Content for index 3" },
+    { "name": "detail_4", "value": "Content for index 4" },
+    { "name": "detail_default", "value": "Unknown index" },
+    { "name": "nav_detail_title", "value": "Nav Detail Page" },
+    { "name": "nav_detail_0", "value": "Content for param 0" },
+    { "name": "nav_detail_1", "value": "Content for param 1" },
+    { "name": "nav_detail_2", "value": "Content for param 2" },
+    { "name": "nav_route_a", "value": "Entered Route A" },
+    { "name": "nav_route_b", "value": "Entered Route B" },
+    { "name": "nav_entry", "value": "Nav Entry" },
+    { "name": "nav_entry_title", "value": "Nav Entry Page" },
+    { "name": "nav_entry_hint", "value": "Tap list items below" },
     { "name": "unused_string", "value": "Nobody references me" }
   ]
 }

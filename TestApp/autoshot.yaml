@@ -1,0 +1,4 @@
+# TestApp 真机截图配置
+# hdc：DevEco Studio 自带版本（PATH 里的 HMS Core 版本过旧，hidumper 会报
+# "sdk hdc.exe version is too low"，无法获取屏幕分辨率）
+hdc_path: "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc"

@@ -94,6 +94,11 @@ def bfs_path(page_adj: Dict[str, List[dict]], entry: str, target: str) -> Option
 def click_steps_for_path(path: List[dict], index: ResourceIndex) -> List[dict]:
     steps: List[dict] = []
     for edge in path:
+        # 条件路由：边带 viaItems（已枚举出"点哪个列表项进这个路由"），取第一个
+        items = edge.get("viaItems")
+        if items:
+            steps.append({"click": f"text={items[0]}"})
+            continue
         label = resolve_label(edge.get("viaKey"), edge.get("viaText"), index)
         if label:
             steps.append({"click": f"text={label}"})
@@ -122,6 +127,38 @@ def trigger_and_reset(usage: Usage, index: ResourceIndex) -> Tuple[Optional[dict
     return trigger, reset
 
 
+def param_nav_step(usage: Usage, path: List[dict], index: ResourceIndex) -> Optional[dict]:
+    """路由参数条件的导航点击步骤。
+
+    链路：usage 是 `if (this.index === N)`（param_var='index', param_value='2'），
+    导航路径某条边携带 param.literal（如 {index: idx}）且列表项文案是模板串
+    `详情项${idx}`（viaTemplate='详情项', viaVar='idx'）。
+
+    推导：要满足 index===N，需点击文案为「viaTemplate + N」的列表项
+    （因为列表项文案 = viaTemplate + viaVar 的值，而 viaVar 正是 param 值的来源）。
+
+    返回 {'click': 'text=详情项2'}；推导不出返回 None（需手写兜底）。
+    """
+    if not (usage.param_var and usage.param_value is not None):
+        return None
+    for edge in path:
+        param = edge.get("param")
+        if not param or not param.get("literal"):
+            continue
+        if usage.param_var not in param["literal"]:
+            continue
+        # param.literal[index] 是表达式文本（如 'idx'），须等于边 viaVar（列表项循环变量）
+        lit_val = param["literal"][usage.param_var]
+        via_template = edge.get("viaTemplate")
+        via_var = edge.get("viaVar")
+        if via_template and via_var and lit_val == via_var:
+            text = f"{via_template}{usage.param_value}"
+            return {"click": f"text={text}"}
+        # 边有 param 但列表项文案不可推导（viaTemplate/viaVar 缺失）→ 无法自动
+        return None
+    return None
+
+
 # ---- 对外：生成场景注册表内容 ----
 
 def generate(scan: ScanResult, index: ResourceIndex, project_root: str) -> Dict:
@@ -138,20 +175,28 @@ def generate(scan: ScanResult, index: ResourceIndex, project_root: str) -> Dict:
             key_target[key] = pages[0]["page"]
 
     # 按 (页面, 触发签名) 分组
+    # 触发签名需区分：普通 toggle 点击 vs 路由参数点击（同页不同参数 → 不同场景）
     groups: Dict[Tuple[str, str], List[str]] = {}
+    # 先为每个 key 预计算导航路径，供 param_nav_step 使用
     for key, page in key_target.items():
         usage = pick_usage([u for u in scan.usages if u.key == key])
         if usage is None:
             continue
+        path = bfs_path(scan.page_adj, entry, page) if (entry and entry != page) else []
         trigger, _ = trigger_and_reset(usage, index)
+        param_click = param_nav_step(usage, path, index) if usage.param_var else None
         sig = ""
-        if trigger:
+        if param_click:
+            # 路由参数条件：签名带上"点哪个列表项"，不同参数进不同场景
+            sig = f"param:{param_click.get('click', '')}"
+        elif trigger:
             sig = f"trigger:{trigger.get('click', '')}"
         groups.setdefault((page, sig), []).append(key)
 
     for (page, sig), keys in sorted(groups.items()):
         usage = pick_usage([u for u in scan.usages if u.key == keys[0]])
         steps: List[dict] = list(default_steps)
+        path = []
         if entry and entry != page:
             path = bfs_path(scan.page_adj, entry, page)
             if path is None:
@@ -160,12 +205,18 @@ def generate(scan: ScanResult, index: ResourceIndex, project_root: str) -> Dict:
                                "conditions": {"_needs_manual_nav": "true"}})
                 continue
             steps += click_steps_for_path(path, index)
-        trigger, _ = trigger_and_reset(usage, index)
-        if trigger:
-            steps.append(trigger)
+        # 路由参数条件：追加"点对应列表项"步骤（进入详情页前）
+        if sig.startswith("param:"):
+            param_click = param_nav_step(usage, path, index)
+            if param_click:
+                steps.append(param_click)
+        else:
+            trigger, _ = trigger_and_reset(usage, index)
+            if trigger:
+                steps.append(trigger)
         name = page.replace("/", "_").replace("pages_", "")
         if sig:
-            name += "__" + sig.replace("trigger:click:text=", "").replace(" ", "_")
+            name += "__" + sig.replace("trigger:click:text=", "").replace("param:click:text=", "").replace(" ", "_")
         scenes.append({"name": name, "keys": keys, "steps": steps})
 
     return {"default": {"steps": default_steps}, "scenes": scenes}

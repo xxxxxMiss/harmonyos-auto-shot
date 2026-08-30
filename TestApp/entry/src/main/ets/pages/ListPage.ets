@@ -29,6 +29,10 @@ struct ListPage {
               .padding(24)
               .backgroundColor('#F2F3F5')
               .borderRadius(8)
+              .onClick(() => {
+                // 所有列表项跳转同一个 DetailPage，携带不同 index 参数
+                router.pushUrl({ url: 'pages/DetailPage', params: { index: idx } })
+              })
           }
         }, (_item: string, idx: number) => idx.toString())
       }

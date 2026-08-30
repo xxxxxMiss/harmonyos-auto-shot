@@ -59,6 +59,9 @@ class Usage:
     toggle_var: Optional[str] = None
     toggle_via_key: Optional[str] = None
     toggle_via_text: Optional[str] = None
+    # 阶段四新增：路由参数条件（if (this.index === N) → paramVar/paramValue）
+    param_var: Optional[str] = None
+    param_value: Optional[str] = None
 
 
 @dataclass
@@ -133,7 +136,8 @@ def _scan_ast(root: str) -> ScanResult:
             struct_name=u.get("struct"), method_name=u.get("method"),
             trigger_via_key=u.get("triggerViaKey"), trigger_via_text=u.get("triggerViaText"),
             toggle_var=u.get("toggleVar"), toggle_via_key=u.get("toggleViaKey"),
-            toggle_via_text=u.get("toggleViaText")))
+            toggle_via_text=u.get("toggleViaText"),
+            param_var=u.get("paramVar"), param_value=u.get("paramValue")))
     for d in data.get("dynamicRefs", []):
         res.dynamic_refs.append(DynamicRef(d["expr"], d["file"], d["line"], d.get("lineText", "")))
     res.accessors = data.get("accessors", [])

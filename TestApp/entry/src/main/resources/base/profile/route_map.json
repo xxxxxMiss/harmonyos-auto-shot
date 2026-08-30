@@ -1,0 +1,19 @@
+{
+  "routerMap": [
+    {
+      "name": "NavDetailPage",
+      "pageSourceFile": "src/main/ets/pages/NavDetailPage.ets",
+      "buildFunction": "NavDetailPageBuilder"
+    },
+    {
+      "name": "NavRouteAPage",
+      "pageSourceFile": "src/main/ets/pages/NavRouteAPage.ets",
+      "buildFunction": "NavRouteAPageBuilder"
+    },
+    {
+      "name": "NavRouteBPage",
+      "pageSourceFile": "src/main/ets/pages/NavRouteBPage.ets",
+      "buildFunction": "NavRouteBPageBuilder"
+    }
+  ]
+}
