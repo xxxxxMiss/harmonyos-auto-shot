@@ -59,17 +59,24 @@ const ctx = {{ file: entry.rec.file, cls: 'NavEntryPage', root, fileIndex, resol
 def test_multi_statement_function_condition():
     """多语句函数（isPremiumItem）+ 对象数组（getRouteItems）+ 跨文件 import。"""
     out = _eval_scenario("""
-// 找场景3 的 ForEach（getRouteItems）与 if（isPremiumItem）
-let fe, cond, inElse = false, target;
+// 找场景3 的 ForEach（getRouteItems），并在其回调内找 NavRouteAPage 的 pushPathByName
+let fe = null, target = null;
 (function walk(n) {
-  if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'ForEach'
+  if (!fe && ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'ForEach'
       && n.arguments[0].getText(entry.sf) === 'getRouteItems()') fe = n;
-  if (ts.isCallExpression(n) && n.expression.getText(entry.sf).includes('pushPathByName') && n.getText(entry.sf).includes('NavRouteAPage')) target = n;
+  if (fe && !target && ts.isCallExpression(n) && n.expression.getText(entry.sf).includes('pushPathByName')
+      && n.getText(entry.sf).includes('NavRouteAPage')) {
+    // 只在场景3 的 ForEach 回调内找（target 是 fe 的后代）
+    let isDesc = false, p = n.parent;
+    while (p) { if (p === fe) { isDesc = true; break; } p = p.parent; }
+    if (isDesc) target = n;
+  }
   ts.forEachChild(n, walk);
 })(entry.sf);
 const cb = fe.arguments[1];
 const paramNames = cb.parameters.map(p => p.name.text);
 // 找 target 的 if 祖先
+let inElse = false;
 let p = target.parent; let ifNode;
 while (p) { if (ts.isIfStatement(p)) { ifNode = p; inElse = false; break; } if (ts.isArrowFunction(p)) break; p = p.parent; }
 const items = evaluateRouteItems({
@@ -153,3 +160,68 @@ const items = evaluateRouteItems({
 console.log('RESULT ' + JSON.stringify(items));
 """)
     assert "路由项B1" in out and "路由项B3" in out
+
+
+@pytest.mark.skipif(not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "node_modules")),
+                    reason="需要 npm install")
+def test_builtin_methods_string_and_array():
+    """求值器内建方法：字符串 startsWith/includes/indexOf + 数组 some/includes + 算术。"""
+    out = run_node("""
+import { loadTypescript } from './tools/ts_loader.mjs';
+const ts = loadTypescript().ts;
+import { evalExpr } from './tools/predicate_eval.mjs';
+
+// 抽象值用 evalExpr 求值：构造表达式，env 里注入字符串/数组
+function ev(code, env = {}) {
+  const sf = ts.createSourceFile('x.ts', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const stmt = sf.statements[0];
+  const expr = ts.isExpressionStatement(stmt) ? stmt.expression : stmt;
+  const v = evalExpr(expr, env, { depth: 0 });
+  return v ? (v.v !== undefined ? v.k + ':' + v.v : v.k) : 'null';
+}
+
+const env = { s: { k: 'str', v: 'premium' }, arr: { k: 'arr', items: [{ k: 'str', v: 'premium' }, { k: 'str', v: 'basic' }] } };
+console.log('startsWith', ev("s.startsWith('pre')", env));   // bool:true
+console.log('includes', ev("s.includes('rem')", env));        // bool:true
+console.log('indexOf', ev("s.indexOf('ium')", env));          // num:4
+console.log('modulo', ev("7 % 2", {}));                        // num:1
+console.log('multiply', ev("3 * 4", {}));                      // num:12
+console.log('arr.includes', ev("arr.includes('basic')", env)); // bool:true
+console.log('arr.length', ev("arr.length", env));              // num:2
+""")
+    assert "startsWith bool:true" in out
+    assert "includes bool:true" in out
+    assert "indexOf num:4" in out
+    assert "modulo num:1" in out
+    assert "multiply num:12" in out
+    assert "arr.includes bool:true" in out
+    assert "arr.length num:2" in out
+
+
+@pytest.mark.skipif(not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "node_modules")),
+                    reason="需要 npm install")
+def test_array_callback_methods():
+    """数组高阶方法：some / find / filter / map 带箭头回调。"""
+    out = run_node("""
+import { loadTypescript } from './tools/ts_loader.mjs';
+const ts = loadTypescript().ts;
+import { evalExpr } from './tools/predicate_eval.mjs';
+function ev(code, env = {}) {
+  const sf = ts.createSourceFile('x.ts', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const stmt = sf.statements[0];
+  const expr = ts.isExpressionStatement(stmt) ? stmt.expression : stmt;
+  const v = evalExpr(expr, env, { depth: 0 });
+  if (!v) return 'null';
+  if (v.k === 'arr') return 'arr:' + v.items.map(i => i.v).join(',');
+  return v.k + ':' + v.v;
+}
+const env = { items: { k: 'arr', items: [{ k: 'str', v: 'premium' }, { k: 'str', v: 'basic' }, { k: 'str', v: 'premium' }] } };
+console.log('some', ev("items.some((x) => x === 'premium')", env));       // bool:true
+console.log('find', ev("items.find((x) => x === 'basic')", env));          // str:basic
+console.log('filter', ev("items.filter((x) => x === 'premium')", env));    // arr:premium,premium
+console.log('map_len', ev("items.map((x) => x.length)", env));             // arr:7,5,7
+""")
+    assert "some bool:true" in out
+    assert "find str:basic" in out
+    assert "filter arr:premium,premium" in out
+    assert "map_len arr:7,5,7" in out

@@ -15,6 +15,7 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import { evaluateRouteItems } from './predicate_eval.mjs';
 import { loadTypescript, needsStructPreprocess, typescriptSource } from './ts_loader.mjs';
+import { buildProgram, resolveSymbol, constantValue } from './ts_program.mjs';
 const ts = loadTypescript().ts;
 
 const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href;
@@ -457,11 +458,22 @@ function main() {
   const pages = discoverPages(root);
   const pageByFile = new Map(pages.filter(p => p.exists).map(p => [p.file, p.name]));
 
+  // P2：优先用 Program + checker（语义分析，跨文件符号/常量求值），
+  //     官方 TS 模式（无 struct 原生支持）回退纯语法扫描。
+  const prog = buildProgram(root);
+  const checker = prog?.checker ?? null;
+  const program = prog?.program ?? null;
+
   const parsed = [];
   const doPreprocess = needsStructPreprocess();   // fork 版原生支持 struct，无需预处理
   for (const f of files) {
     const raw = readText(f); if (raw == null) continue;
-    const src = ts.createSourceFile(f, doPreprocess ? preprocess(raw) : raw, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    // 优先复用 Program 里的 sourceFile（checker 能解析其符号）；回退则独立 createSourceFile
+    const abs = path.resolve(f);
+    let src = program?.getSourceFile(abs) ?? null;
+    if (!src) {
+      src = ts.createSourceFile(f, doPreprocess ? preprocess(raw) : raw, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    }
     const rec = analyzeFile(root, f, src);
     parsed.push({ abs: f, src, rec });
   }
@@ -745,6 +757,8 @@ function main() {
     const evalCtx = {
       file: e.from, cls: e.struct, root,
       fileIndex, resolveImport,
+      checker,   // P2：注入 checker，求值器跨文件符号解析/常量求值走语义分析
+      resolveSymbol, constantValue,
     };
     const items = evaluateRouteItems({
       conditionNode: rc.condition,

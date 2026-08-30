@@ -61,3 +61,14 @@ export function needsStructPreprocess() {
 export function typescriptSource() {
   return loadTypescript().source;
 }
+
+// struct→class 预处理（仅官方 TS 需要；fork 版原生支持 struct）。
+// 掩码保护字符串/注释，正则替换 struct，再还原。
+export function preprocessStruct(source) {
+  const protectedParts = [];
+  const masked = source.replace(
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g,
+    (m) => { protectedParts.push(m); return `\u0000${protectedParts.length - 1}\u0000`; });
+  const replaced = masked.replace(/\bstruct\s+([A-Za-z_$][\w$]*)/g, 'class $1');
+  return replaced.replace(/\u0000(\d+)\u0000/g, (_, i) => protectedParts[+i]);
+}

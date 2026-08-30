@@ -132,3 +132,33 @@ def test_no_handwritten_needed_for_different_route(scan, index):
 def test_navigation_to_nav_detail(scan, index):
     steps = navigation_steps_to_page(scan, index, "NavDetailPage", "com.example.hualitd")
     assert {"click": "text=导航入口"} in steps
+
+
+# ---- 场景4：枚举常量路由判断（P2 增量，仅 fork 模式可推导）----
+
+def test_enum_constant_route_condition(scan):
+    """isVipLevel(item) 内部用 ItemLevel.Premium（=3）枚举，checker 符号路径求值。
+
+    仅 fork 模式（含 checker）可推导；官方模式（AUTOSHOT_TS=official）降级为无 viaItems。
+    """
+    edge_a = next(e for e in scan.edges if e["to"] == "NavRouteAPage" and e.get("viaTemplate") == "VIP项")
+    edge_b = next(e for e in scan.edges if e["to"] == "NavRouteBPage" and e.get("viaTemplate") == "VIP项")
+    # ItemLevel.Premium = 3，item.level >= 3 → 只有 level=3 的 basic3 进 A
+    assert edge_a["viaItems"] == ["VIP项basic3"]
+    # 其余（level 0/1/2）进 B
+    assert "VIP项premium0" in edge_b["viaItems"]
+    assert "VIP项premium1" in edge_b["viaItems"]
+    assert "VIP项basic2" in edge_b["viaItems"]
+
+
+# ---- 场景5：字符串方法 + 算术取模（P0 增量）----
+
+def test_string_method_and_modulo_route_condition(scan):
+    """isEvenIndexed(item, idx) = idx % 2 === 0 && item.kind.startsWith('pre')。"""
+    edge_a = next(e for e in scan.edges if e["to"] == "NavRouteAPage" and e.get("viaTemplate") == "偶数项")
+    edge_b = next(e for e in scan.edges if e["to"] == "NavRouteBPage" and e.get("viaTemplate") == "偶数项")
+    # idx 偶数且 kind 以 'pre' 开头：只有 idx=0（premium）满足
+    assert edge_a["viaItems"] == ["偶数项premium0"]
+    assert "偶数项premium1" in edge_b["viaItems"]   # idx=1 奇数
+    assert "偶数项basic2" in edge_b["viaItems"]      # idx=2 偶数但 kind=basic
+    assert "偶数项basic3" in edge_b["viaItems"]      # idx=3 奇数

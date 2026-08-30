@@ -81,6 +81,7 @@ export function evalExpr(node, env, ctx) {
     return UNKNOWN;
   }
   // this.xxx（TS AST 里 this 是 ThisKeyword，不是 Identifier）
+  // 或 obj.field / arr.length / 枚举成员 Enum.Member
   if (ts.isPropertyAccessExpression(node)) {
     if (node.expression.kind === ts.SyntaxKind.ThisKeyword) {
       const rec = ctx.fileIndex?.get(ctx.file);
@@ -89,11 +90,16 @@ export function evalExpr(node, env, ctx) {
       if (cls?.arrayProps?.has(node.name.text)) return evalExpr(cls.arrayProps.get(node.name.text), env, ctx);
       return UNKNOWN;
     }
-    // obj.field / arr.length
+    // P2：枚举成员（ItemLevel.Premium）→ checker.getConstantValue 求值
+    if (ctx.checker && ctx.constantValue) {
+      const cv = ctx.constantValue(ctx.checker, node);
+      if (cv) return cv.kind === 'str' ? STR(cv.value) : cv.kind === 'num' ? NUM(cv.value) : cv.kind === 'bool' ? BOOL(cv.value) : NULL();
+    }
     const objV = evalExpr(node.expression, env, ctx);
     if (isUnknown(objV)) return UNKNOWN;
     if (objV.k === 'obj') return objV.fields.get(node.name.text) ?? UNKNOWN;
     if (objV.k === 'arr' && node.name.text === 'length') return NUM(objV.items.length);
+    if (objV.k === 'str' && node.name.text === 'length') return NUM(objV.v.length);
     return UNKNOWN;
   }
   // 元素访问 arr[i] / obj['key']
@@ -181,6 +187,12 @@ function evalBinary(op, l, r) {
       return UNKNOWN;
     case ts.SyntaxKind.MinusToken:
       return (l.k === 'num' && r.k === 'num') ? NUM(l.v - r.v) : UNKNOWN;
+    case ts.SyntaxKind.AsteriskToken:
+      return (l.k === 'num' && r.k === 'num') ? NUM(l.v * r.v) : UNKNOWN;
+    case ts.SyntaxKind.SlashToken:
+      return (l.k === 'num' && r.k === 'num' && r.v !== 0) ? NUM(l.v / r.v) : UNKNOWN;
+    case ts.SyntaxKind.PercentToken:
+      return (l.k === 'num' && r.k === 'num' && r.v !== 0) ? NUM(l.v % r.v) : UNKNOWN;
     default: return UNKNOWN;
   }
 }
@@ -206,9 +218,21 @@ function fnDefOf(fn) {
 
 // 定位一个 CallExpression 对应的用户函数定义（本地 class 方法 / 顶层函数 / 箭头函数 / import）
 export function findFunction(callNode, ctx) {
+  const callee = callNode.expression;
+  // P2：checker 优先 —— 跨文件符号解析（含 import alias 解开）
+  if (ctx.checker) {
+    const { resolveSymbol } = ctx.resolveSymbol ?? {};
+    if (resolveSymbol) {
+      const r = resolveSymbol(ctx.checker, ts.isIdentifier(callee) ? callee : callee.name, ctx.root);
+      const decl = r?.declaration;
+      if (decl && (ts.isFunctionDeclaration(decl) || ts.isMethodDeclaration(decl) ||
+                   ts.isArrowFunction(decl) || ts.isFunctionExpression(decl))) {
+        return fnDefOf(decl);
+      }
+    }
+  }
   const rec = ctx.fileIndex?.get(ctx.file);
   if (!rec) return null;
-  const callee = callNode.expression;
   // this.method(...)
   if (ts.isPropertyAccessExpression(callee) && callee.expression.kind === ts.SyntaxKind.ThisKeyword) {
     const cls = rec.classes?.get(ctx.cls);
@@ -233,16 +257,15 @@ export function findFunction(callNode, ctx) {
 }
 
 function evalCall(node, env, ctx) {
-  // 内建：arr.push(...)
-  if (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'push') {
-    const objV = evalExpr(node.expression.expression, env, ctx);
-    if (objV.k !== 'arr') return UNKNOWN;
-    for (const arg of node.arguments) {
-      const v = evalExpr(arg, env, ctx);
-      if (isUnknown(v)) return UNKNOWN;
-      objV.items.push(v);
+  // ---- 内建方法（字符串 / 数组 / 通用）----
+  if (ts.isPropertyAccessExpression(node.expression)) {
+    const method = node.expression.name.text;
+    const recv = evalExpr(node.expression.expression, env, ctx);
+    if (!isUnknown(recv)) {
+      const args = node.arguments.map(a => evalExpr(a, env, ctx));
+      const builtin = evalBuiltinMethod(method, recv, args, node, env, ctx);
+      if (builtin !== null) return builtin;
     }
-    return NUM(objV.items.length);
   }
   // 用户函数
   if ((ctx.depth ?? 0) > 8) return UNKNOWN;
@@ -258,6 +281,126 @@ function evalCall(node, env, ctx) {
     ? evalStatements(fn.body.statements, newEnv, { ...ctx, depth: (ctx.depth ?? 0) + 1 })
     : { flow: 'return', value: evalExpr(fn.body.expression, newEnv, { ...ctx, depth: (ctx.depth ?? 0) + 1 }) };
   return res.flow === 'return' ? res.value : UNKNOWN;
+}
+
+// 内建方法求值：返回抽象值；不认该方法时返回 null（交由用户函数/UNKNOWN 兜底）
+function evalBuiltinMethod(method, recv, args, node, env, ctx) {
+  const anyUnknown = args.some(isUnknown);
+  // ---- 字符串方法 ----
+  if (recv.k === 'str') {
+    const s = recv.v;
+    if (anyUnknown) return UNKNOWN;
+    switch (method) {
+      case 'startsWith': return BOOL(s.startsWith(strOf(args[0])));
+      case 'endsWith': return BOOL(s.endsWith(strOf(args[0])));
+      case 'includes': return BOOL(s.includes(strOf(args[0])));
+      case 'indexOf': return NUM(s.indexOf(strOf(args[0])));
+      case 'lastIndexOf': return NUM(s.lastIndexOf(strOf(args[0])));
+      case 'toLowerCase': return STR(s.toLowerCase());
+      case 'toUpperCase': return STR(s.toUpperCase());
+      case 'trim': return STR(s.trim());
+      case 'slice': {
+        if (args.length === 0 || args[0].k !== 'num') return UNKNOWN;
+        const start = args[0].v;
+        const end = args.length >= 2 && args[1].k === 'num' ? args[1].v : undefined;
+        return STR(end === undefined ? s.slice(start) : s.slice(start, end));
+      }
+      case 'split': {
+        if (args.length === 0 || args[0].k !== 'str') return UNKNOWN;
+        const sep = args[0].v;
+        const parts = s.split(sep);
+        return ARR(parts.map(p => STR(p)));
+      }
+      case 'length': return NUM(s.length);
+      case 'charAt': return (args[0]?.k === 'num') ? STR(s.charAt(args[0].v)) : UNKNOWN;
+      default: return null;
+    }
+  }
+  // ---- 数组方法 ----
+  if (recv.k === 'arr') {
+    const arr = recv.items;
+    switch (method) {
+      case 'length': return NUM(arr.length);
+      case 'includes': return anyUnknown ? UNKNOWN : BOOL(arr.some(x => eq(x, args[0])));
+      case 'indexOf': return anyUnknown ? UNKNOWN : NUM(arr.findIndex(x => eq(x, args[0])));
+      case 'join': {
+        const sep = args.length === 0 || args[0].k === 'str' ? (args[0]?.v ?? ',') : null;
+        if (sep === null) return UNKNOWN;
+        if (arr.some(x => x.k !== 'str')) return UNKNOWN;
+        return STR(arr.map(x => x.v).join(sep));
+      }
+      case 'some':
+      case 'every':
+      case 'find':
+      case 'findIndex':
+      case 'filter':
+      case 'map':
+        return evalArrayCallback(method, arr, node, env, ctx);
+      case 'push': {
+        // 副作用：arr.push(...) 会改 recv，但 recv 是值拷贝，语义上等价返回新长度
+        for (const a of args) { if (isUnknown(a)) return UNKNOWN; arr.push(a); }
+        return NUM(arr.length);
+      }
+      case 'concat': {
+        if (anyUnknown) return UNKNOWN;
+        const out = [...arr];
+        for (const a of args) { if (a.k === 'arr') out.push(...a.items); else out.push(a); }
+        return ARR(out);
+      }
+      case 'slice': {
+        if (args.length === 0 || args[0].k !== 'num') return UNKNOWN;
+        const start = args[0].v;
+        const end = args.length >= 2 && args[1].k === 'num' ? args[1].v : undefined;
+        return ARR(end === undefined ? arr.slice(start) : arr.slice(start, end));
+      }
+      default: return null;
+    }
+  }
+  return null;
+}
+
+// 数组高阶方法（some/every/find/findIndex/filter/map）：回调是箭头函数，逐元素求值
+function evalArrayCallback(method, arr, node, env, ctx) {
+  const cb = node.arguments[0];
+  if (!ts.isArrowFunction(cb) && !ts.isFunctionExpression(cb)) return UNKNOWN;
+  const params = cb.parameters.map(p => ts.isIdentifier(p.name) ? p.name.text : null);
+  if (params.some(p => p === null)) return UNKNOWN;
+  const results = [];
+  for (let i = 0; i < arr.length; i++) {
+    const cbEnv = Object.create(env || null);
+    // 回调参数：第 1 个=元素，第 2 个=下标
+    if (params[0]) cbEnv[params[0]] = arr[i];
+    if (params[1]) cbEnv[params[1]] = NUM(i);
+    let ret;
+    if (cb.body) {
+      const res = ts.isBlock(cb.body)
+        ? evalStatements(cb.body.statements, cbEnv, { ...ctx, depth: (ctx.depth ?? 0) + 1 })
+        : { flow: 'return', value: evalExpr(cb.body, cbEnv, { ...ctx, depth: (ctx.depth ?? 0) + 1 }) };
+      ret = res.flow === 'return' ? res.value : UNKNOWN;
+    } else {
+      ret = UNKNOWN;
+    }
+    if (isUnknown(ret)) return UNKNOWN;
+    results.push({ i, elem: arr[i], v: ret });
+  }
+  switch (method) {
+    case 'some': return BOOL(results.some(r => truthy(r.v)));
+    case 'every': return BOOL(results.every(r => truthy(r.v)));
+    // find/findIndex/filter 语义：返回"满足条件的元素"（而非回调返回值）
+    case 'find': {
+      const hit = results.find(r => truthy(r.v));
+      return hit ? hit.elem : NULL();
+    }
+    case 'findIndex': return NUM(results.find(r => truthy(r.v))?.i ?? -1);
+    case 'filter': return ARR(results.filter(r => truthy(r.v)).map(r => r.elem));
+    // map 语义：返回"回调返回值"
+    case 'map': return ARR(results.map(r => r.v));
+    default: return UNKNOWN;
+  }
+}
+
+function strOf(v) {
+  return v?.k === 'str' ? v.v : v?.k === 'num' ? String(v.v) : '';
 }
 
 // ---- 语句解释执行 ----

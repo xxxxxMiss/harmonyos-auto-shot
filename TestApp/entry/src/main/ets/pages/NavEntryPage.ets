@@ -3,7 +3,7 @@
 // 场景2：按指定条件（列表项类型）→ 进入不同路由（NavRouteA / NavRouteB）
 // 场景3：多语句函数条件 + 对象数组 + 函数返回数组 + 跨文件 import
 // NavPathStack 是全局类型，无需 import
-import { isPremiumItem, getRouteItems, RouteItem } from '../common/RouteUtil';
+import { isPremiumItem, getRouteItems, RouteItem, isVipLevel, isEvenIndexed } from '../common/RouteUtil';
 
 interface NavDetailParam {
   index: number
@@ -86,6 +86,48 @@ struct NavEntryPage {
                 })
             }
           }, (item: RouteItem, idx: number) => `p${idx}`)
+        }
+        .width('94%')
+        // 场景4：枚举常量路由判断（isVipLevel 内部用 ItemLevel.Premium 枚举）
+        List({ space: 10 }) {
+          ForEach(getRouteItems(), (item: RouteItem, idx: number) => {
+            ListItem() {
+              Text(`VIP项${item.kind}${idx}`)
+                .fontSize(18)
+                .width('100%')
+                .padding(24)
+                .backgroundColor('#FDFDE8')
+                .borderRadius(8)
+                .onClick(() => {
+                  if (isVipLevel(item)) {
+                    this.pathStack.pushPathByName('NavRouteAPage', {} as NavRouteParam)
+                  } else {
+                    this.pathStack.pushPathByName('NavRouteBPage', {} as NavRouteParam)
+                  }
+                })
+            }
+          }, (item: RouteItem, idx: number) => `v${idx}`)
+        }
+        .width('94%')
+        // 场景5：字符串方法（startsWith）+ 算术（% 取模）路由判断
+        List({ space: 10 }) {
+          ForEach(getRouteItems(), (item: RouteItem, idx: number) => {
+            ListItem() {
+              Text(`偶数项${item.kind}${idx}`)
+                .fontSize(18)
+                .width('100%')
+                .padding(24)
+                .backgroundColor('#E8E8FD')
+                .borderRadius(8)
+                .onClick(() => {
+                  if (isEvenIndexed(item, idx)) {
+                    this.pathStack.pushPathByName('NavRouteAPage', {} as NavRouteParam)
+                  } else {
+                    this.pathStack.pushPathByName('NavRouteBPage', {} as NavRouteParam)
+                  }
+                })
+            }
+          }, (item: RouteItem, idx: number) => `e${idx}`)
         }
         .width('94%')
       }

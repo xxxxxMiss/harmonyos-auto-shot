@@ -24,6 +24,15 @@ npm install                                   # 阶段二 AST 后端依赖（typ
 - `AUTOSHOT_TS=official` 可强制走官方模式（CI 无 DevEco 环境）。
 - 实测：两种模式对 TestApp 扫描输出**逐项一致**（41 usages / 10 edges / 9 pages）。
 
+**语义分析（`tools/ts_program.mjs`，P2 阶段）**：
+- fork 模式下构建 TS `Program` + `checker`，用 `getSymbolAtLocation` + `getAliasedSymbol`
+  做**跨文件符号解析**（import alias 解开），用符号路径做**枚举成员常量求值**
+  （如 `ItemLevel.Premium = 3`，`checker.getConstantValue` 对枚举成员无效，需走 EnumMember.initializer）。
+- `.ets` 后缀模块解析通过自定义 `resolveModuleNames` 实现。
+- 性能：千文件语义分析 663ms（纯语法 334ms 的 2 倍），绝对值可接受。
+- **仅 fork 模式可用**：官方模式（无 ArkTS 语义支持）降级为纯语法扫描，枚举/跨文件
+  常量符号解析不可用（场景4 枚举路由判断在官方模式回退为无 viaItems，需手写兜底）。
+
 1001 文件 / 4.5 万行基准（`node tools/gen_bench_fixture.mjs /tmp/bench 1000` 生成）：
 
 - 优化前 ~0.87s，优化后 ~0.75s；其中 `preprocess`（struct→class）由逐字符状态机改为
