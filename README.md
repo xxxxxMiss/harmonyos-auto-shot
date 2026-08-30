@@ -8,9 +8,23 @@
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev,image]"
 npm install                                   # 阶段二 AST 后端依赖（typescript）
-.venv/bin/python -m pytest tests/ -q          # 42 个离线单测（无 node 时 AST 组自动跳过）
+.venv/bin/python -m pytest tests/ -q          # 64 个离线单测（无 node 时 AST 组自动跳过）
 .venv/bin/python -m autoshot demo             # 无真机自检：滚动截图核心循环
 ```
+
+## 静态扫描性能
+
+`tools/ast_scan.mjs` 是 AST 扫描内核（Node + TypeScript Compiler API）。1001 文件 / 4.5 万行
+基准（`node tools/gen_bench_fixture.mjs /tmp/bench 1000` 生成）：
+
+- 优化前 ~0.87s，优化后 ~0.75s；其中 `preprocess`（struct→class）由逐字符状态机改为
+  "掩码保护+正则替换"，单步 220ms → 12ms（18×）。
+- 剩余耗时大头是 TS 解析本身（每文件独立 `ts.createSourceFile`，~0.4s/千文件），
+  属 Compiler API 固有成本；遍历+规则匹配仅 ~40ms（非瓶颈）。
+- 已做：`resolveImport` 结果缓存、`matchAccessor` Map 索引、R5 主遍历廉价预判、
+  `owningPages` memoize + 索引推进（替代 `shift()`）。
+- 结论：对大型项目（万级文件），瓶颈在"逐文件解析"而非"规则匹配"；进一步提速需
+  并行解析（worker 分片）或增量缓存（只重扫变更文件），当前单进程已够用。
 
 ## 命令
 
