@@ -508,7 +508,7 @@ function valueToText(v) {
  *
  * 返回 string[]（可点击的列表项文案）；求不出返回 null（调用方回退手写场景）。
  */
-export function evaluateRouteItems({ conditionNode, sourceNode, paramNames, inElse, viaTemplate, viaVars }, ctx) {
+export function evaluateRouteItems({ conditionNode, sourceNode, paramNames, inElse, viaTemplate, viaVars, viaTernary }, ctx) {
   if (!conditionNode || !sourceNode || !paramNames?.length) return null;
   const items = resolveArray(sourceNode, null, ctx);
   if (!items) return null;
@@ -524,6 +524,14 @@ export function evaluateRouteItems({ conditionNode, sourceNode, paramNames, inEl
     if (isUnknown(condV)) return null;
     const hit = inElse ? !truthy(condV) : truthy(condV);
     if (!hit) continue;
+    // 三元条件文案：Text(cond ? 'A' : 'B')，按条件真假选文案
+    if (viaTernary) {
+      const condExpr = parseTernaryCondition(viaTernary.condition);
+      const tcv = condExpr ? evalExpr(condExpr, env, ctx) : UNKNOWN;
+      if (isUnknown(tcv)) return null;
+      out.push(truthy(tcv) ? viaTernary.whenTrue : viaTernary.whenFalse);
+      continue;
+    }
     // 生成列表项文案：viaTemplate + 各 viaVar 表达式在 env 下求值
     let text = viaTemplate;
     if (viaVars && viaVars.length) {
@@ -541,6 +549,14 @@ export function evaluateRouteItems({ conditionNode, sourceNode, paramNames, inEl
     out.push(text);
   }
   return out.length ? out : null;
+}
+
+// 解析三元条件表达式文本（如 "type==='A'"）为可求值的 AST
+function parseTernaryCondition(text) {
+  const sf = ts.createSourceFile('cond.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const stmt = sf.statements[0];
+  if (ts.isExpressionStatement(stmt)) return stmt.expression;
+  return null;
 }
 
 // 把 viaVar 表达式文本（'type' / 'idx' / 'item.kind'）解析成 AST 节点

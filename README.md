@@ -40,9 +40,18 @@ npm install                                   # 阶段二 AST 后端依赖（typ
 - 剩余耗时大头是 TS 解析本身（每文件独立 `ts.createSourceFile`，~0.4s/千文件），
   属 Compiler API 固有成本；遍历+规则匹配仅 ~40ms（非瓶颈）。
 - 已做：`resolveImport` 结果缓存、`matchAccessor` Map 索引、R5 主遍历廉价预判、
-  `owningPages` memoize + 索引推进（替代 `shift()`）。
-- 结论：对大型项目（万级文件），瓶颈在"逐文件解析"而非"规则匹配"；进一步提速需
-  并行解析（worker 分片）或增量缓存（只重扫变更文件），当前单进程已够用。
+  `owningPages` memoize + 索引推进（替代 `shift()`）、classify 廉价判断（避免 getText 文本匹配）。
+
+**万级文件性能（P5）**：
+
+- 10001 文件实测：首次全量扫描 **7.2s**，其中 createProgram 语义分析占 4.1s（57%，
+  checker 全局单例，**不可并行**），主遍历约 3s。
+- **增量缓存（已实现）**：基于源文件 + 配置文件 mtime/size 指纹 + **扫描器自身版本**（
+  ast_scan/predicate_eval/ts_program/ts_loader 的 mtime，避免工具升级后旧缓存返回过时结果）。
+  命中缓存时 **0.32s**（快 22 倍）；改一个文件后正确失效重扫。
+- **并行解析评估结论：不做**。语义分析（57% 大头）是 checker 单例不可并行；剩余可并行的
+  语法遍历仅 ~3s，worker 通信开销 + checker 无法跨 worker 共享，收益低复杂度高。
+  对"老项目反复扫描"场景，增量缓存已解决核心诉求（日常 0.32s）。
 
 ## 命令
 
@@ -190,6 +199,10 @@ hdc install -r entry/build/default/outputs/default/entry-default-signed.hap
     if/else、多 return、局部变量、有界 for 循环）、数据源为**函数返回数组**
     （含 `arr.push()` 构造）、**跨文件 import** 的函数定位、列表项为**对象数组**
     （`item.kind` 成员访问）。超出子集的（递归/无界循环/真实异步数据）→ 回退手写 scenes.yaml。
+  - **动态路由名 + 三元文案（P3-b）**：`pushPathByName(cond ? 'A' : 'B')` 拆成真假两条边；
+    `Text(cond ? '文案A' : '文案B')` 按条件值选文案生成 viaItems。
+  - **求值器方法（P0）**：算术 `* / %`；字符串 `startsWith/endsWith/includes/indexOf` 等 12 个；
+    数组 `some/every/find/filter/map` 等 13 个（含箭头回调）。
 - **同路由不同参数（旧 router 方案）**：`router.pushUrl({url, params})` 只记录 url 不记录
   params，且列表项三元表达式提取不到触发标签；这类 key 需手写 scenes.yaml
   （见 `detail_*` 场景，`tests/test_same_route_diff_params.py`）。

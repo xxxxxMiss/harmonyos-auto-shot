@@ -21,14 +21,15 @@ struct NavEntryPage {
 
   build() {
     Navigation(this.pathStack) {
-      Column({ space: 16 }) {
-        Text($r('app.string.nav_entry_title'))
-          .fontSize(24)
-          .fontWeight(FontWeight.Bold)
-          .margin({ top: 64 })
-        Text($r('app.string.nav_entry_hint'))
-          .fontSize(14)
-          .fontColor('#999999')
+      Scroll() {
+        Column({ space: 16 }) {
+          Text($r('app.string.nav_entry_title'))
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .margin({ top: 64 })
+          Text($r('app.string.nav_entry_hint'))
+            .fontSize(14)
+            .fontColor('#999999')
         // 场景1：同路由不同参数（3 个列表项都进 NavDetailPage，index 0/1/2）
         List({ space: 10 }) {
           ForEach([0, 1, 2], (idx: number) => {
@@ -130,10 +131,47 @@ struct NavEntryPage {
           }, (item: RouteItem, idx: number) => `e${idx}`)
         }
         .width('94%')
+        // 场景6：三元动态路由名（P3-b）—— pushPathByName(cond ? 'A' : 'B')
+        List({ space: 10 }) {
+          ForEach(this.routes, (type: string, idx: number) => {
+            ListItem() {
+              Text(`三元项${type}${idx}`)
+                .fontSize(18)
+                .width('100%')
+                .padding(24)
+                .backgroundColor('#FDE8E8')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.pathStack.pushPathByName(type === 'A' ? 'NavRouteAPage' : 'NavRouteBPage', {} as NavRouteParam)
+                })
+            }
+          }, (type: string, idx: number) => `t${idx}`)
+        }
+        .width('94%')
+        // 场景7：三元条件文案（P3-b）—— Text(cond ? '文案A' : '文案B')
+        List({ space: 10 }) {
+          ForEach(this.routes, (type: string, idx: number) => {
+            ListItem() {
+              Text(type === 'A' ? '三元文案A' : '三元文案B')
+                .fontSize(18)
+                .width('100%')
+                .padding(24)
+                .backgroundColor('#E8FDE8')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.pathStack.pushPathByName(type === 'A' ? 'NavRouteAPage' : 'NavRouteBPage', {} as NavRouteParam)
+                })
+            }
+          }, (type: string, idx: number) => `c${idx}`)
+        }
+          .width('94%')
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Center)
       }
+      .scrollable(ScrollDirection.Vertical)
       .width('100%')
       .height('100%')
-      .alignItems(HorizontalAlign.Center)
     }
   }
 }

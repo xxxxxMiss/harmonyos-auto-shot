@@ -162,3 +162,31 @@ def test_string_method_and_modulo_route_condition(scan):
     assert "偶数项premium1" in edge_b["viaItems"]   # idx=1 奇数
     assert "偶数项basic2" in edge_b["viaItems"]      # idx=2 偶数但 kind=basic
     assert "偶数项basic3" in edge_b["viaItems"]      # idx=3 奇数
+
+
+# ---- 场景6：三元动态路由名（P3-b）----
+
+def test_ternary_dynamic_route_name(scan):
+    """pushPathByName(type === 'A' ? 'NavRouteAPage' : 'NavRouteBPage') 拆成两条边。"""
+    edge_a = next(e for e in scan.edges if e["to"] == "NavRouteAPage" and e.get("viaTemplate") == "三元项")
+    edge_b = next(e for e in scan.edges if e["to"] == "NavRouteBPage" and e.get("viaTemplate") == "三元项")
+    # routeCond 保留三元条件，A 是 then 分支（inElse=false），B 是 else（inElse=true）
+    assert edge_a["routeCond"]["conditionText"] == "type === 'A'"
+    assert edge_a["routeCond"]["inElse"] is False
+    assert edge_b["routeCond"]["inElse"] is True
+    # 枚举：type==='A' 的项进 A，其余进 B
+    assert edge_a["viaItems"] == ["三元项A0", "三元项A2"]
+    assert edge_b["viaItems"] == ["三元项B1", "三元项B3"]
+
+
+# ---- 场景7：三元条件文案（P3-b）----
+
+def test_ternary_condition_text(scan):
+    """Text(type === 'A' ? '三元文案A' : '三元文案B')，文案随条件值变化。"""
+    edge_a = next(e for e in scan.edges if e["to"] == "NavRouteAPage" and e.get("viaTernary"))
+    edge_b = next(e for e in scan.edges if e["to"] == "NavRouteBPage" and e.get("viaTernary"))
+    assert edge_a["viaTernary"] == {"condition": "type==='A'", "whenTrue": "三元文案A", "whenFalse": "三元文案B"}
+    # type==='A' 的项（A0/A2）文案是「三元文案A」进 A
+    assert edge_a["viaItems"] == ["三元文案A", "三元文案A"]
+    # type==='B' 的项（B1/B3）文案是「三元文案B」进 B
+    assert edge_b["viaItems"] == ["三元文案B", "三元文案B"]

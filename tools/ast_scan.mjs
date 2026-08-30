@@ -12,7 +12,9 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { pathToFileURL } from 'url';
+import os from 'os';
+import crypto from 'crypto';
+import { pathToFileURL, fileURLToPath } from 'url';
 import { evaluateRouteItems } from './predicate_eval.mjs';
 import { loadTypescript, needsStructPreprocess, typescriptSource } from './ts_loader.mjs';
 import { buildProgram, resolveSymbol, constantValue } from './ts_program.mjs';
@@ -29,9 +31,8 @@ const PRUNE = new Set(['oh_modules', 'node_modules', 'build', '.hvigor', '.previ
 const BYNAME = new Set(['getStringByNameSync', 'getStringByName', 'getPluralStringByNameSync',
   'getPluralStringByName', 'getStringArrayByNameSync', 'getStringArrayByName']);
 const ID_APIS = new Set(['getStringSync', 'getStringValue', 'getString']);
-const DIALOG_CALLEE = ['AlertDialog.show', 'promptAction.showToast', 'promptAction.showDialog',
-  'promptAction.openCustomDialog', 'promptAction.showActionMenu',
-  'this.getUIContext().showAlertDialog', 'showToast', 'showDialog', 'openCustomDialog'];
+// dialog 方法名集合（property access 的 name 部分，供 classify 廉价判断，避免 getText）
+const DIALOG_METHODS = new Set(['showToast', 'showDialog', 'openCustomDialog', 'showActionMenu', 'showAlertDialog']);
 
 // ---------- 工具 ----------
 function fail(msg) { console.error('[ast_scan] ' + msg); process.exit(2); }
@@ -43,6 +44,72 @@ function readJsonLoose(p) {
   try { return JSON.parse(clean(t)); } catch { return null; }
 }
 function rel(root, p) { return path.relative(root, p).split(path.sep).join('/'); }
+
+// ---------- 增量缓存（P5）：文件指纹比对，未变则复用上次扫描结果 ----------
+function cachePathFor(root) {
+  const key = crypto.createHash('md5').update(path.resolve(root)).digest('hex').slice(0, 16);
+  return path.join(os.tmpdir(), `autoshot_cache_${key}.json`);
+}
+
+// 收集指纹输入：所有源文件 + 配置文件（json5/json，含 build-profile/module.json5/资源）
+function collectFingerprintInputs(root, files) {
+  const inputs = [...files];
+  const CONFIG_PRUNE = new Set(['node_modules', '.hvigor', 'build', '.idea', '.git', 'oh_modules']);
+  (function walk(dir) {
+    let es; try { es = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of es) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!CONFIG_PRUNE.has(e.name)) walk(p); continue; }
+      if (e.name.endsWith('.json5') || e.name.endsWith('.json')) inputs.push(p);
+    }
+  })(root);
+  return inputs;
+}
+
+function computeFingerprint(root, files) {
+  const entries = [];
+  for (const f of collectFingerprintInputs(root, files)) {
+    try {
+      const st = fs.statSync(f);
+      entries.push(rel(root, f) + '\u0000' + st.mtimeMs + '\u0000' + st.size);
+    } catch { entries.push(rel(root, f) + '\u0000MISSING'); }
+  }
+  entries.sort();
+  // 关键：纳入扫描器自身版本（含 ast_scan/predicate_eval/ts_program/ts_loader 的 mtime），
+  // 避免工具逻辑升级后旧缓存返回过时结果。
+  const toolsDir = path.dirname(fileURLToPath(import.meta.url));
+  const selfFiles = [fileURLToPath(import.meta.url),
+    path.join(toolsDir, 'predicate_eval.mjs'),
+    path.join(toolsDir, 'ts_program.mjs'),
+    path.join(toolsDir, 'ts_loader.mjs')];
+  for (const f of selfFiles) {
+    try {
+      const st = fs.statSync(f);
+      entries.push('__SELF__\u0000' + f + '\u0000' + st.mtimeMs + '\u0000' + st.size);
+    } catch { /* 忽略 */ }
+  }
+  entries.sort();
+  return crypto.createHash('sha256').update(entries.join('\n')).digest('hex');
+}
+
+function tryLoadCache(root, files) {
+  const cacheFile = cachePathFor(root);
+  if (!fs.existsSync(cacheFile)) return null;
+  try {
+    const cache = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+    const fp = computeFingerprint(root, files);
+    if (cache.fingerprint === fp && cache.result) return cache.result;
+  } catch { /* 缓存损坏，忽略 */ }
+  return null;
+}
+
+function writeCache(root, files, result) {
+  try {
+    const cacheFile = cachePathFor(root);
+    const fp = computeFingerprint(root, files);
+    fs.writeFileSync(cacheFile, JSON.stringify({ fingerprint: fp, result }, null, 0));
+  } catch { /* 写缓存失败不影响主流程 */ }
+}
 
 // ---------- struct→class 预处理（跳过字符串与注释内的关键字） ----------
 export function preprocess(source) {
@@ -288,10 +355,17 @@ function classify(sourceFile, node, currentClass, currentFn) {
       if (!tags.includes('conditional')) tags.push('conditional');
     }
     if (ts.isCallExpression(p)) {
-      const calleeText = p.expression.getText(sourceFile).replace(/\s+/g, '');
-      if (!dialogNode && DIALOG_CALLEE.some(d => calleeText.endsWith(d) || calleeText.includes(d))) {
-        dialogNode = p;
-        if (!tags.includes('click')) tags.push('click');
+      // 廉价判断：先看 callee 是不是 property access，且 name 命中 dialog 方法名集合，
+      // 避免对每个祖先 CallExpression 都做 getText() 字符串匹配（万级文件的大头）。
+      if (!dialogNode && ts.isPropertyAccessExpression(p.expression)) {
+        const mname = p.expression.name.text;
+        const recvText = ts.isIdentifier(p.expression.expression) ? p.expression.expression.text : null;
+        // showToast/showDialog/openCustomDialog/showActionMenu 等方法名；
+        // AlertDialog.show / CustomDialogController 等 receiver 为 dialog 控制器的 .show
+        if (DIALOG_METHODS.has(mname) || (mname === 'show' && (recvText === 'AlertDialog' || /Dialog/i.test(recvText || '')))) {
+          dialogNode = p;
+          if (!tags.includes('click')) tags.push('click');
+        }
       }
       if (ts.isPropertyAccessExpression(p.expression)) {
         const m = /^on[A-Z]/.exec(p.expression.name.text);
@@ -342,6 +416,14 @@ function labelOfArg(arg0) {
       }
     }
     return { viaTemplate: parts.prefix, viaVars: parts.vars, viaVar: parts.vars.length === 1 ? parts.vars[0] : null };
+  }
+  // 三元条件文案：Text(cond ? '文案A' : '文案B')
+  if (ts.isConditionalExpression(arg0)) {
+    const whenTrue = ts.isStringLiteral(arg0.whenTrue) ? arg0.whenTrue.text : null;
+    const whenFalse = ts.isStringLiteral(arg0.whenFalse) ? arg0.whenFalse.text : null;
+    if (whenTrue !== null && whenFalse !== null) {
+      return { viaTernary: { condition: arg0.condition.getText().replace(/\s+/g, ''), whenTrue, whenFalse } };
+    }
   }
   return null;
 }
@@ -457,6 +539,14 @@ function main() {
   const files = collectSourceFiles(root);
   const pages = discoverPages(root);
   const pageByFile = new Map(pages.filter(p => p.exists).map(p => [p.file, p.name]));
+
+  // P5 增量缓存：文件未变则直接复用上次结果（跳过 createProgram + 全量遍历）
+  const cached = tryLoadCache(root, files);
+  if (cached) {
+    const json = JSON.stringify(cached);
+    if (outPath) fs.writeFileSync(outPath, json); else process.stdout.write(json);
+    return;
+  }
 
   // P2：优先用 Program + checker（语义分析，跨文件符号/常量求值），
   //     官方 TS 模式（无 struct 原生支持）回退纯语法扫描。
@@ -625,16 +715,35 @@ function main() {
           }
         }
         // pushPathByName('Name'[, param])：NavDestination 系统路由表方案，name 为路由名
-        if (apiName === 'pushPathByName' && args.length > 0 && ts.isStringLiteral(args[0])) {
+        if (apiName === 'pushPathByName' && args.length > 0) {
           const via = climbTriggerLabel(node, src);
           const param = extractParam(args[1], rec);
           const routeCond = routeConditionOf(node, src);
-          const fe = routeCond ? forEachContextOf(node, src) : null;
-          edges.push({ from: rec.file, to: args[0].text, api: 'pushPathByName',
+          const fe = forEachContextOf(node, src);   // ForEach 上下文查找独立于 if 条件
+          const baseEdge = {
+            from: rec.file, api: 'pushPathByName',
             viaKey: via?.viaKey ?? null, viaText: via?.viaText ?? null,
             viaTemplate: via?.viaTemplate ?? null, viaVar: via?.viaVar ?? null,
             viaVars: via?.viaVars ?? null,
-            param, routeCond, forEach: fe, struct: currentClass });
+            viaTernary: via?.viaTernary ?? null,
+            param, forEach: fe, struct: currentClass,
+          };
+          // P3-b：动态路由名 —— pushPathByName(cond ? 'A' : 'B', param)
+          // 拆成两条边（真假分支），复用条件路由枚举。
+          if (ts.isConditionalExpression(args[0])) {
+            const cond = args[0];
+            const whenTrue = cond.whenTrue, whenFalse = cond.whenFalse;
+            if (ts.isStringLiteral(whenTrue)) {
+              edges.push({ ...baseEdge, to: whenTrue.text,
+                routeCond: { condition: cond.condition, inElse: false } });
+            }
+            if (ts.isStringLiteral(whenFalse)) {
+              edges.push({ ...baseEdge, to: whenFalse.text,
+                routeCond: { condition: cond.condition, inElse: true } });
+            }
+          } else if (ts.isStringLiteral(args[0])) {
+            edges.push({ ...baseEdge, to: args[0].text, routeCond });
+          }
         }
         // pushPath({name:'Name', param:{...}}) 或 pushPath('Name', param)：兼容两种形态
         if (apiName === 'pushPath' && args.length > 0) {
@@ -753,7 +862,8 @@ function main() {
   // 链路：if 条件（含函数调用）+ ForEach 数据源 + 列表项文案模板 + 边 viaVars。
   for (const e of edges) {
     const rc = e.routeCond, fe = e.forEach;
-    if (!rc || !fe || !e.viaVars) continue;
+    if (!rc || !fe) continue;
+    if (!e.viaVars && !e.viaTernary) continue;   // 无文案模板也无三元文案，跳过
     const evalCtx = {
       file: e.from, cls: e.struct, root,
       fileIndex, resolveImport,
@@ -767,6 +877,7 @@ function main() {
       inElse: rc.inElse,
       viaTemplate: e.viaTemplate,
       viaVars: e.viaVars,
+      viaTernary: e.viaTernary,
     }, evalCtx);
     if (items) e.viaItems = items;
   }
@@ -808,6 +919,8 @@ function main() {
     pages: pages.map(p => ({ name: p.name, file: p.file, exists: p.exists, depth: depth.has(p.name) ? depth.get(p.name) : null, via: p.via ?? null })),
     edges: cleanEdges, keyPages, pageAdj, toggles,
   };
+  // P5 增量缓存：写入结果供下次复用
+  writeCache(root, files, result);
   const json = JSON.stringify(result, null, 1);
   if (outPath) fs.writeFileSync(outPath, json); else process.stdout.write(json);
 }
