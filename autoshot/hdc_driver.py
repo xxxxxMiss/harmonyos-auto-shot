@@ -81,6 +81,14 @@ class HdcDriver:
     def app_stop(self, bundle: str) -> None:
         self._shell("aa", "force-stop", bundle)
 
+    def inject_launch(self, bundle: str, route: str, state: Optional[dict] = None) -> None:
+        """白盒注入直达：带 autoshot.route / autoshot.state.* 参数启动（配合入口注入分支）。"""
+        params = [f"autoshot.route={route}"]
+        for k, v in (state or {}).items():
+            params.append(f"autoshot.state.{k}={v}")
+        self._shell("aa", "start", "-b", bundle, "-a", self.cfg.main_ability,
+                    "--pi", " ".join(params))
+
     # ---- UI 树 ----
     def dump_layout(self) -> dict:
         """uitest dumpLayout，优先落盘再 recv，失败时直接解析 stdout。"""

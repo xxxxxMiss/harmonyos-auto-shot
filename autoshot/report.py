@@ -107,7 +107,7 @@ class Report:
         for i, r in enumerate(self.results, 1):
             mark = "✅ 成功" if r.ok else "❌ 失败"
             detail = r.path or r.error or "-"
-            method = "探索" if r.method == "explore" else "场景"
+            method = {"scene": "场景", "explore": "探索", "inject": "注入"}.get(r.method, r.method)
             lines.append(f"| {i} | `{r.key}` | {mark} | {method} | {detail} |")
         lines.append("")
 

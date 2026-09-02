@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Protocol, Tuple
 
 from .layout import (Node, Viewport, find_by_text, iter_nodes, normalize_text,
                      parse_tree, scroll_delta_to_center)
@@ -41,6 +41,12 @@ class Action:
         if self.kind == "back":
             return "back"
         return f"stuck:{self.reason}"
+
+
+class Policy(Protocol):
+    """决策策略。返回 None 表示"该策略无动作/未启用，交给策略链下一层"。"""
+
+    def decide(self, snap: "Snapshot", candidates: Iterable[str]) -> Optional[Action]: ...
 
 
 @dataclass
@@ -153,20 +159,37 @@ class HeuristicPolicy:
             n = _find_clickable(snap, a)
             if n:
                 return Action("click", node=n, reason=f"anchor:{a}")
-        # 6. 放弃（back 由 Explorer 处理）
-        return Action("stuck", reason="无导航标签/无滚动/无候选命中")
+        # 6. 无动作：返回 None，交给策略链下一层（LLM / 白盒注入），或由 Explorer 判定放弃
+        return None
 
 
 class Explorer:
     """观察-决策-动作主循环。可复用 Shooter 的滚动/截屏能力。"""
 
-    def __init__(self, driver, cfg, policy: HeuristicPolicy, shooter: Optional[Shooter] = None):
+    def __init__(self, driver, cfg, policy: Optional[HeuristicPolicy] = None,
+                 policies: Optional[List[Policy]] = None, shooter: Optional[Shooter] = None):
         self.driver = driver
         self.cfg = cfg
-        self.policy = policy
         self.shooter = shooter or Shooter(driver, cfg)
+        if policies is not None:
+            self.policies = list(policies)
+        elif policy is not None:
+            self.policies = [policy]
+        else:
+            self.policies = [HeuristicPolicy(cfg)]
         self._depth = 0              # 粗略导航深度（点击 +1，回退 -1）
         self._seen_sigs: dict = {}   # 状态指纹计数，用于环路检测
+
+    def _decide(self, snap: Snapshot, cands: Iterable[str]) -> Optional[Action]:
+        """依次询问策略链，返回第一个非 None 动作；全部放弃返回 None。"""
+        for p in self.policies:
+            try:
+                a = p.decide(snap, cands)
+            except Exception:
+                continue
+            if a is not None:
+                return a
+        return None
 
     # ---- 视口 ----
     def _viewport(self, tree) -> Viewport:
@@ -237,14 +260,14 @@ class Explorer:
                     time.sleep(self.cfg.poll_interval)
                     continue
 
-            # 无匹配 → 策略决定下一步
-            action = self.policy.decide(snap, cands)
+            # 无匹配 → 策略链决定下一步
+            action = self._decide(snap, cands)
             if action is None or action.kind == "stuck":
                 if self._depth > 0:
-                    self._apply(Action("back", reason="stuck 回退"), vp)
+                    self._apply(Action("back", reason="策略链无动作 回退"), vp)
                     continue
                 raise TargetNotFound(
-                    f"{name}: 探索 {step} 步后无可用动作（{action.reason if action else '无策略'}）")
+                    f"{name}: 探索 {step} 步后无可用动作")
             self._apply(action, vp)
         raise TargetNotFound(
             f"{name}: 探索 {self.cfg.max_explore_steps} 步后仍未找到 {cands[:3]}...")

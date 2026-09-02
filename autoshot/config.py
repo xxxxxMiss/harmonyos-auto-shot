@@ -33,6 +33,12 @@ class Config:
     dismiss_texts: List[str] = field(default_factory=lambda: ["我知道了", "知道了", "暂不"])
     # 运行时探索无图引导时，用于继续深入的通用入口文案（语义锚点）
     anchor_texts: List[str] = field(default_factory=lambda: ["设置", "更多", "我的", "登录", "菜单", "个人中心", "关于", "更多设置"])
+    # LLM 决策策略（P1，可选）：{base_url, api_key, model, max_calls_per_key, timeout, max_tokens}
+    # 未配置 api_key 时 LLMPolicy.available=False，策略链自动跳过
+    llm: Optional[Dict[str, Any]] = None
+    # 白盒注入（P2，可选）：{enabled: bool}。enabled=true 表示被测工程已装注入入口
+    # （EntryAbility 读 want.parameters 的 autoshot.route → AppStorage → 首页直达）。
+    inject: Optional[Dict[str, Any]] = None
     main_ability: str = "EntryAbility"      # aa start 必须显式指定 ability（系统禁止隐式启动）
     screen_size: Optional[List[int]] = None  # [w, h] 手动指定，跳过自动探测
 

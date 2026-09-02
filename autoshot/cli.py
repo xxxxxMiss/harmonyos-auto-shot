@@ -135,13 +135,14 @@ def _resolve_scene(cfg, index, key, scenes_path=None, bundle=None):
 def _capture_key(driver, cfg, index, key, candidates, scene, navigator, shooter):
     """导航 + 滚动截图，返回 CaptureResult（异常不抛出，转为失败结果）。
 
-    三级降级：静态场景 fast path -> Explorer 运行时兜底 -> 失败。
+    降级链：静态场景 fast path -> 白盒注入直达 -> Explorer 运行时兜底（启发式 + LLM）-> 失败。
     """
     import time
     from .hdc_driver import HdcError
     from .shooter import TargetNotFound
     from .report import CaptureResult
     t0 = time.time()
+    errors: list = []
     # 1. 静态场景 fast path
     if scene is not None:
         try:
@@ -150,30 +151,61 @@ def _capture_key(driver, cfg, index, key, candidates, scene, navigator, shooter)
             return CaptureResult(input=key, key=key, ok=True, path=path,
                                  duration=time.time() - t0, method="scene")
         except (HdcError, TargetNotFound) as e:
-            fast_err = str(e)
+            errors.append(f"场景: {e}")
         except Exception as e:  # 兜底：任何异常都不中断批量
-            fast_err = f"{type(e).__name__}: {e}"
+            errors.append(f"场景: {type(e).__name__}: {e}")
     else:
-        fast_err = "无可用场景"
-    # 2. Explorer 运行时兜底
+        errors.append("场景: 无可用场景")
+    # 2. 白盒注入直达
+    try:
+        path = _inject_key(driver, cfg, key, candidates, shooter)
+        if path is not None:
+            return CaptureResult(input=key, key=key, ok=True, path=path,
+                                 duration=time.time() - t0, method="inject")
+    except Exception as e:
+        errors.append(f"注入: {type(e).__name__}: {e}")
+    # 3. Explorer 运行时兜底（启发式 + LLM）
     try:
         path = _explore_key(driver, cfg, index, key, candidates)
         return CaptureResult(input=key, key=key, ok=True, path=path,
                              duration=time.time() - t0, method="explore")
     except Exception as e:
-        explore_err = f"{type(e).__name__}: {e}"
+        errors.append(f"探索: {type(e).__name__}: {e}")
     return CaptureResult(input=key, key=key, ok=False,
-                         error=f"{fast_err}；探索兜底: {explore_err}",
+                         error="；".join(errors) or "未知失败",
                          duration=time.time() - t0, method="explore")
 
 
+def _inject_key(driver, cfg, key, candidates, shooter) -> Optional[str]:
+    """白盒注入直达：若注入启用且有可达路由，重启直达后滚动截图；否则返回 None。"""
+    import time
+    from .inject import inject_enabled, inject_target_for_key
+    from .auto_scene import bundle_name
+    if not inject_enabled(cfg):
+        return None
+    scan = _scan_once(cfg)
+    route = inject_target_for_key(scan, key)
+    if not route:
+        return None
+    bundle = getattr(cfg, "inject", {}).get("bundle") or bundle_name(cfg.project_root)
+    if not bundle:
+        return None
+    driver.app_stop(bundle)
+    time.sleep(2.5)                      # 与 navigator 重启式启动一致，避限流
+    driver.inject_launch(bundle, route)
+    time.sleep(1.5)
+    return shooter.capture_texts(key, candidates)
+
+
 def _explore_key(driver, cfg, index, key, candidates) -> str:
-    """运行时探索兜底：观察->决策->动作闭环。返回产物路径。"""
+    """运行时探索兜底：观察->决策->动作闭环（启发式 + LLM 策略链）。返回产物路径。"""
     from .explorer import Explorer, HeuristicPolicy
+    from .llm import LLMPolicy
     scan = _scan_once(cfg)
     page_adj = getattr(scan, "page_adj", None) if scan is not None else None
-    policy = HeuristicPolicy(cfg, page_adj=page_adj, index=index)
-    explorer = Explorer(driver, cfg, policy)
+    policies = [HeuristicPolicy(cfg, page_adj=page_adj, index=index),
+                LLMPolicy(cfg, driver, page_adj=page_adj, index=index)]
+    explorer = Explorer(driver, cfg, policies=policies)
     return explorer.reach_and_shoot(key, candidates)
 
 
