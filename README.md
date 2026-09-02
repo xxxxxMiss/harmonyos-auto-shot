@@ -12,6 +12,24 @@ npm install                                   # 阶段二 AST 后端依赖（typ
 .venv/bin/python -m autoshot demo             # 无真机自检：滚动截图核心循环
 ```
 
+> Windows 下 venv 脚本在 `.venv\Scripts\`，命令相应改为
+> `.venv\Scripts\pip install -e ".[dev,image]"` 与 `.venv\Scripts\python -m ...`。
+
+## 跨平台说明（Linux / macOS / Windows）
+
+工具本体是纯 Python + Node，跨平台运行；与平台相关的只有两处**可执行程序探测**：
+
+- **node**：优先 `PATH`（`shutil.which`），找不到时按平台兜底找 DevEco Studio 自带
+  node（macOS `/Applications/DevEco-Studio.app/...`、Windows `Program Files\Huawei\DevEco Studio\...`、
+  Linux `~/DevEco-Studio/...` 或 `/opt/...`）。见 `autoshot/scanner.py:find_node`。
+- **鸿蒙 fork TypeScript**（`tools/ts_loader.mjs`）：优先 `DEVECO_SDK_HOME` 环境变量，
+  否则按平台兜底找 DevEco SDK 内 `ets-loader/node_modules/typescript`；找不到则回退项目
+  `node_modules/typescript`（官方版 + struct→class 预处理），功能等价。
+
+真机截图需要 `hdc`：Linux/Windows 上若 `hdc` 不在 `PATH`，用 `--hdc-path` 或
+`autoshot.yaml` 的 `hdc_path` 指定（Windows 下是 `hdc.exe`）。设备端命令（`aa`/`uitest`/
+`hidumper`）运行在 HarmonyOS 设备上，与宿主 OS 无关。
+
 ## 静态扫描性能
 
 `tools/ast_scan.mjs` 是 AST 扫描内核（TypeScript Compiler API）。

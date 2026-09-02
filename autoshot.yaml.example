@@ -2,7 +2,7 @@
 # 所有字段均可省略，CLI 参数优先级更高
 
 # device_serial: "127.0.0.1:5555"
-# hdc_path: hdc
+# hdc_path: hdc                  # 不在 PATH 时指定绝对路径（Windows 下是 hdc.exe）
 # screen_size: [1080, 2340]
 # image_format: png            # png | jpeg（设备截屏恒为 JPEG，png 需装 Pillow 转码）
 # locale: zh_CN                # 限定语种；缺省用所有语种值参与匹配

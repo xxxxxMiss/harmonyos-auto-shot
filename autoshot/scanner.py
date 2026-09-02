@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -95,13 +96,30 @@ class ScanResult:
 
 # ---------- AST 后端 ----------
 
+def _deveco_node_candidates() -> List[str]:
+    """各平台 DevEco Studio 自带 node 的候选路径（PATH 找不到时兜底）。"""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return ["/Applications/DevEco-Studio.app/Contents/tools/node/bin/node"]
+    if sys.platform.startswith("win"):
+        base = os.environ.get("ProgramFiles") or r"C:\Program Files"
+        return [os.path.join(base, "Huawei", "DevEco Studio", "tools", "node", "node.exe")]
+    # linux
+    return [
+        os.path.join(home, "DevEco-Studio", "tools", "node", "bin", "node"),
+        "/opt/DevEco-Studio/tools/node/bin/node",
+    ]
+
+
 def find_node() -> Optional[str]:
-    """node 探测：PATH 优先，其次 DevEco Studio 自带。"""
+    """node 探测：PATH 优先，其次 DevEco Studio 自带（跨平台）。"""
     n = shutil.which("node")
     if n:
         return n
-    deveco = "/Applications/DevEco-Studio.app/Contents/tools/node/bin/node"
-    return deveco if os.path.isfile(deveco) else None
+    for p in _deveco_node_candidates():
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def ast_backend_available() -> bool:

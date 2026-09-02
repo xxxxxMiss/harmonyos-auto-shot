@@ -10,6 +10,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -21,8 +22,17 @@ function candidateForkPaths() {
     paths.push(path.join(sdkHome, 'openharmony', 'ets', 'build-tools', 'ets-loader', 'node_modules', 'typescript'));
     paths.push(path.join(sdkHome, 'default', 'openharmony', 'ets', 'build-tools', 'ets-loader', 'node_modules', 'typescript'));
   }
-  // 默认 DevEco Studio 安装位置（macOS）
-  paths.push('/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript');
+  const home = os.homedir();
+  if (process.platform === 'darwin') {
+    paths.push('/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript');
+  } else if (process.platform === 'win32') {
+    const base = process.env.ProgramFiles || 'C:\\Program Files';
+    paths.push(path.join(base, 'Huawei', 'DevEco Studio', 'sdk', 'default', 'openharmony', 'ets', 'build-tools', 'ets-loader', 'node_modules', 'typescript'));
+  } else {
+    // linux
+    paths.push(path.join(home, 'DevEco-Studio', 'sdk', 'default', 'openharmony', 'ets', 'build-tools', 'ets-loader', 'node_modules', 'typescript'));
+    paths.push('/opt/DevEco-Studio/sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript');
+  }
   return paths;
 }
 

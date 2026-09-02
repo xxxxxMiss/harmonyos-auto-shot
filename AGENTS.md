@@ -99,3 +99,4 @@ cd TestApp && export DEVECO_SDK_HOME="/Applications/DevEco-Studio.app/Contents/s
 - 修改 `tools/*.mjs` 后必须跑 `node --check` + 全量 pytest（增量缓存会因扫描器 mtime 变化自动失效，但测试前建议清缓存避免假失败）。
 - 修改 TestApp 页面结构后，测试里依赖 pages/edges 的断言（`test_scanner_ast.py`、`test_nav_destination.py`）可能需要同步更新。
 - `this` 在 TS AST 里是 `ThisKeyword` 不是 `Identifier`（`ts.isIdentifier(expr.expression)` 判断 `this.xxx` 是错的，用 `expr.expression.kind === ts.SyntaxKind.ThisKeyword`）。
+- **跨平台（Linux/Windows/macOS）**：可执行程序路径一律走"PATH 探测 + 按平台兜底"，禁止硬编码 macOS 绝对路径。node 探测见 `scanner.py:find_node`，鸿蒙 fork TS 探测见 `tools/ts_loader.mjs:candidateForkPaths`（两者已按 `sys.platform` / `process.platform` 分支）。新增可执行程序探测时照此办理，且设备端路径（`/data/local/tmp/...`）是设备上的路径，不能与宿主 OS 混为一谈。
