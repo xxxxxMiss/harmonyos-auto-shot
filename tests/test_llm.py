@@ -25,6 +25,13 @@ def test_llm_policy_disabled_without_api_key():
     assert p.decide(None, ["x"]) is None
 
 
+def test_placeholder_api_key_treated_as_disabled():
+    """占位符 api_key（sk-REPLACE_ME）不应被当成已配置，否则会真调 API 超时。"""
+    for ph in ("sk-REPLACE_ME", "sk-xxx", "<your-api-key>", "sk-placeholder"):
+        assert not LLMClient({"api_key": ph}).available, f"{ph} 应视为未配置"
+    assert LLMClient({"api_key": "sk-real-actual-key"}).available
+
+
 def test_llm_policy_click_by_node_id():
     cfg = Config(project_root=".")
     driver = AppDriver()

@@ -26,6 +26,10 @@ from .explorer import Action, Snapshot, _find_clickable
 from .layout import normalize_text
 
 
+# 明显占位符（sk-REPLACE_ME / sk-xxx / <your key> 等）视为"未配置"，避免真去调 API 超时
+_PLACEHOLDER_RE = re.compile(r"(?i)(replace|placeholder|xxx+|your[-_ ]?key|<[^>]+>)")
+
+
 def _extract_json(text: str) -> dict:
     """从模型输出里提取第一个 JSON 对象（容忍 markdown fence / 前后缀噪声）。"""
     if not text:
@@ -56,7 +60,9 @@ class LLMClient:
 
     @property
     def available(self) -> bool:
-        return bool(self.api_key)
+        if not self.api_key:
+            return False
+        return not _PLACEHOLDER_RE.search(self.api_key)
 
     def decide_action(self, prompt: str, shot_bytes: bytes) -> dict:
         b64 = base64.b64encode(shot_bytes).decode("ascii")

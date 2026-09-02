@@ -2,3 +2,18 @@
 # hdc：DevEco Studio 自带版本（PATH 里的 HMS Core 版本过旧，hidumper 会报
 # "sdk hdc.exe version is too low"，无法获取屏幕分辨率）
 hdc_path: "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc"
+
+# ---- LLM 视觉决策（P1，可选）----
+# 启发式探索穷尽时，用视觉模型判下一步。填上真实 key 即启用；留空则只用启发式。
+llm:
+  base_url: https://api.openai.com/v1   # OpenAI 兼容接口，DeepSeek/Qwen/GPT-4o 均可
+  api_key: "sk-REPLACE_ME"              # 占位符，替换为真实 key 或设 AUTOSHOT_LLM_API_KEY
+  model: gpt-4o
+  max_calls_per_key: 8
+  timeout: 30
+  max_tokens: 300
+
+# ---- 白盒注入直达（P2，可选）----
+# 需入口按 docs/inject_example.md 加注入分支后 enabled: true。
+# inject:
+#   enabled: false
