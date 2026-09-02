@@ -94,6 +94,24 @@ def _ocr(image_path: str) -> str:
     return " ".join(line[1] for line in result)
 
 
+_SCAN_CACHE: dict = {}
+
+
+def _scan_once(cfg):
+    """按工程根缓存一次 ast 扫描结果；ast 不可用或扫描失败返回 None。"""
+    root = cfg.project_root
+    if root not in _SCAN_CACHE:
+        from .scanner import ast_backend_available, scan_project
+        if not ast_backend_available():
+            _SCAN_CACHE[root] = None
+        else:
+            try:
+                _SCAN_CACHE[root] = scan_project(root, backend="ast")
+            except Exception:
+                _SCAN_CACHE[root] = None
+    return _SCAN_CACHE[root]
+
+
 def _resolve_scene(cfg, index, key, scenes_path=None, bundle=None):
     """场景解析：手写 scenes.yaml > 自动场景(ast 导航图推导) > --bundle 直启。"""
     from .scene import Scene, SceneRegistry
@@ -103,29 +121,60 @@ def _resolve_scene(cfg, index, key, scenes_path=None, bundle=None):
         scene = registry.find_for_key(key) or registry.default
     if scene is None:
         scene = _auto_scene_for_key(cfg, index, key)
-    if bundle and not scene:
-        scene = Scene(name="cli", steps=[{"launch": bundle}])
+    if not scene:
+        if bundle:
+            scene = Scene(name="cli", steps=[{"launch": bundle}])
+        else:
+            from .auto_scene import bundle_name
+            b = bundle_name(cfg.project_root)
+            if b:
+                scene = Scene(name="cli", steps=[{"launch": b}])
     return scene
 
 
 def _capture_key(driver, cfg, index, key, candidates, scene, navigator, shooter):
-    """导航 + 滚动截图，返回 CaptureResult（异常不抛出，转为失败结果）。"""
+    """导航 + 滚动截图，返回 CaptureResult（异常不抛出，转为失败结果）。
+
+    三级降级：静态场景 fast path -> Explorer 运行时兜底 -> 失败。
+    """
     import time
     from .hdc_driver import HdcError
     from .shooter import TargetNotFound
     from .report import CaptureResult
     t0 = time.time()
+    # 1. 静态场景 fast path
+    if scene is not None:
+        try:
+            navigator.run(scene.steps)
+            path = shooter.capture_texts(key, candidates)
+            return CaptureResult(input=key, key=key, ok=True, path=path,
+                                 duration=time.time() - t0, method="scene")
+        except (HdcError, TargetNotFound) as e:
+            fast_err = str(e)
+        except Exception as e:  # 兜底：任何异常都不中断批量
+            fast_err = f"{type(e).__name__}: {e}"
+    else:
+        fast_err = "无可用场景"
+    # 2. Explorer 运行时兜底
     try:
-        navigator.run(scene.steps)
-        path = shooter.capture_texts(key, candidates)
+        path = _explore_key(driver, cfg, index, key, candidates)
         return CaptureResult(input=key, key=key, ok=True, path=path,
-                             duration=time.time() - t0)
-    except (HdcError, TargetNotFound) as e:
-        return CaptureResult(input=key, key=key, ok=False, error=str(e),
-                             duration=time.time() - t0)
-    except Exception as e:  # 兜底：任何异常都转失败结果，不中断批量
-        return CaptureResult(input=key, key=key, ok=False,
-                             error=f"{type(e).__name__}: {e}", duration=time.time() - t0)
+                             duration=time.time() - t0, method="explore")
+    except Exception as e:
+        explore_err = f"{type(e).__name__}: {e}"
+    return CaptureResult(input=key, key=key, ok=False,
+                         error=f"{fast_err}；探索兜底: {explore_err}",
+                         duration=time.time() - t0, method="explore")
+
+
+def _explore_key(driver, cfg, index, key, candidates) -> str:
+    """运行时探索兜底：观察->决策->动作闭环。返回产物路径。"""
+    from .explorer import Explorer, HeuristicPolicy
+    scan = _scan_once(cfg)
+    page_adj = getattr(scan, "page_adj", None) if scan is not None else None
+    policy = HeuristicPolicy(cfg, page_adj=page_adj, index=index)
+    explorer = Explorer(driver, cfg, policy)
+    return explorer.reach_and_shoot(key, candidates)
 
 
 def cmd_shoot(args) -> int:
@@ -258,12 +307,8 @@ def _auto_scene_for_key(cfg, index, key):
     """用 ast 导航图自动推导该 key 的场景（无 ast/node 环境返回 None）。"""
     from .auto_scene import bundle_name, generate
     from .scene import Scene, SceneRegistry
-    from .scanner import ast_backend_available, scan_project
-    if not ast_backend_available():
-        return None
-    try:
-        scan = scan_project(cfg.project_root, backend="ast")
-    except Exception:
+    scan = _scan_once(cfg)
+    if scan is None:
         return None
     data = generate(scan, index, cfg.project_root)
     if not data.get("scenes") and not bundle_name(cfg.project_root):

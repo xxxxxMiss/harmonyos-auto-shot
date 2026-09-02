@@ -39,6 +39,7 @@ class CaptureResult:
     path: Optional[str] = None
     error: Optional[str] = None
     duration: float = 0.0
+    method: str = "scene"   # scene=静态场景 fast path / explore=运行时探索兜底
 
 
 @dataclass
@@ -101,12 +102,13 @@ class Report:
         # 处理结果
         lines.append(f"## 二、处理结果")
         lines.append("")
-        lines.append("| # | key | 结果 | 产物 / 失败原因 |")
-        lines.append("|---|---|---|---|")
+        lines.append("| # | key | 结果 | 方式 | 产物 / 失败原因 |")
+        lines.append("|---|---|---|---|---|")
         for i, r in enumerate(self.results, 1):
             mark = "✅ 成功" if r.ok else "❌ 失败"
             detail = r.path or r.error or "-"
-            lines.append(f"| {i} | `{r.key}` | {mark} | {detail} |")
+            method = "探索" if r.method == "explore" else "场景"
+            lines.append(f"| {i} | `{r.key}` | {mark} | {method} | {detail} |")
         lines.append("")
 
         # 汇总
@@ -131,8 +133,8 @@ class Report:
             "unresolved": [{"input": u.input, "reason": u.reason,
                             "candidates": u.candidates} for u in self.unresolved],
             "results": [{"input": r.input, "key": r.key, "ok": r.ok,
-                         "path": r.path, "error": r.error, "duration": round(r.duration, 2)}
-                        for r in self.results],
+                         "path": r.path, "error": r.error, "duration": round(r.duration, 2),
+                         "method": r.method} for r in self.results],
         }
 
     def write_json(self, path: str) -> str:

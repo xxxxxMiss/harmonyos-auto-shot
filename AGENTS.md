@@ -22,6 +22,7 @@ autoshot/           Python 包（CLI + 执行层）
 ├── batch.py        按页面聚合批量截图
 ├── navigator.py    步骤执行器（launch/click/expect/swipe…）
 ├── shooter.py      滚动到视野 + 截屏（核心循环）
+├── explorer.py     运行时探索兜底（观察→决策→动作闭环，静态 fast path 失败后接管）
 ├── hdc_driver.py   hdc 封装（dumpLayout/uiInput/截屏）
 ├── layout.py       无障碍树解析 + 文本匹配降级链
 └── report.py       总结报告（markdown + json）
@@ -33,7 +34,7 @@ tools/              Node 静态扫描引擎（见 ARCHITECTURE.md）
 └── gen_bench_fixture.mjs  基准 fixture 生成
 TestApp/            可构建安装到真机的鸿蒙测试工程（覆盖全部测试形态）
 fixtures/sample_app/  离线扫描测试用最小工程
-tests/              单测（91 个，pytest）
+tests/              单测（95 个，pytest）
 ```
 
 ## 关键命令
@@ -44,7 +45,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev,image]"
 npm install                                   # 阶段二 AST 后端依赖 typescript
 
 # 测试
-.venv/bin/python -m pytest tests/ -q          # 91 个测试；无 node 时 AST 组自动跳过
+.venv/bin/python -m pytest tests/ -q          # 95 个测试；无 node 时 AST 组自动跳过
 
 # 静态扫描（离线）
 .venv/bin/python -m autoshot scan -p TestApp --backend ast
@@ -82,10 +83,10 @@ cd TestApp && export DEVECO_SDK_HOME="/Applications/DevEco-Studio.app/Contents/s
 
 ## 已知边界（不要试图硬做静态分析的部分）
 
-- **异步数据 / 服务端下发 / 副作用函数**：静态分析的理论天花板，编译期无值可求。这类走运行时兜底（尚未实现）。
+- **异步数据 / 服务端下发 / 副作用函数**：静态分析的理论天花板，编译期无值可求。这类走运行时兜底（`explorer.py` 观察→决策→动作闭环，已实现；LLM / 白盒注入决策器为 P1/P2 预留）。
 - **并行解析**：评估结论为"不做"——checker 语义分析（57% 耗时）是全局单例不可并行，增量缓存已解决核心诉求。
 - **跨 `.hsp/.har` 模块**：`$r` 引用归属用文件路径近似，可能不准。
-- **按钮标签动态拼接、服务端配置路由**：自动推导会失败，需手写 scenes.yaml。
+- **按钮标签动态拼接、服务端配置路由**：自动推导会失败；运行时兜底靠"导航图边标签 + 语义锚点 + 环路检测"继续找，仍不可达才回退手写 scenes.yaml。
 
 ## 开发约定
 

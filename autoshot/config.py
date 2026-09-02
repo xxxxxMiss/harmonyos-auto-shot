@@ -20,6 +20,7 @@ class Config:
     image_format: str = "png"            # png | jpeg（注意：设备截屏原始输出恒为 JPEG）
     locale: Optional[str] = None         # 限定语种；None=用所有语种值参与匹配
     max_scroll_steps: int = 12
+    max_explore_steps: int = 40             # 运行时探索兜底的决策步数上限
     # 视口安全边距：避开吸顶栏/底部 tab 悬浮遮挡
     viewport_margin_top: int = 96
     viewport_margin_bottom: int = 96
@@ -30,6 +31,8 @@ class Config:
     # 导航过程中出现这些可点击文案时自动点掉（系统弹窗/权限），按序取第一个命中的
     grant_texts: List[str] = field(default_factory=lambda: ["允许", "仅使用期间允许"])
     dismiss_texts: List[str] = field(default_factory=lambda: ["我知道了", "知道了", "暂不"])
+    # 运行时探索无图引导时，用于继续深入的通用入口文案（语义锚点）
+    anchor_texts: List[str] = field(default_factory=lambda: ["设置", "更多", "我的", "登录", "菜单", "个人中心", "关于", "更多设置"])
     main_ability: str = "EntryAbility"      # aa start 必须显式指定 ability（系统禁止隐式启动）
     screen_size: Optional[List[int]] = None  # [w, h] 手动指定，跳过自动探测
 
