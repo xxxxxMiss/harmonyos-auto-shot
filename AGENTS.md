@@ -92,7 +92,10 @@ cd TestApp && export DEVECO_SDK_HOME="/Applications/DevEco-Studio.app/Contents/s
 
 ## 开发约定
 
+- **Git 工作流（强制）**：
+  - 每次开始修改代码前，先检查 `git status`；若工作区有未提交的改动，**先 commit**，再动手改新东西——避免把上一个 commit 搞丢、也方便出问题时 `git reset` 回退。
+  - 每完成一个新功能（或一个可独立交付的修复），**自动 commit 并 push 到远程**（`origin/main`，`git@github.com:xxxxxMiss/harmonyos-auto-shot.git`），不要攒着等用户手动要求。
+  - 提交前确认无敏感文件（`build-profile.json5` 含调试证书，已在 .gitignore 排除，用 `.example` 模板）。
 - 修改 `tools/*.mjs` 后必须跑 `node --check` + 全量 pytest（增量缓存会因扫描器 mtime 变化自动失效，但测试前建议清缓存避免假失败）。
 - 修改 TestApp 页面结构后，测试里依赖 pages/edges 的断言（`test_scanner_ast.py`、`test_nav_destination.py`）可能需要同步更新。
-- 提交前确认无敏感文件（`build-profile.json5` 含调试证书，已在 .gitignore 排除，用 `.example` 模板）。
 - `this` 在 TS AST 里是 `ThisKeyword` 不是 `Identifier`（`ts.isIdentifier(expr.expression)` 判断 `this.xxx` 是错的，用 `expr.expression.kind === ts.SyntaxKind.ThisKeyword`）。
