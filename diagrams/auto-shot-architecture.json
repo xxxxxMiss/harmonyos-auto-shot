@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "auto-shot 截图自动化架构",
+    "locale": "zh-CN",
+    "output": "auto-shot-architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main-path",
+        "label": "主链路",
+        "focus": ["cli", "resolve", "scanner", "auto_scene", "navigator", "shooter", "hdc_driver", "device"],
+        "note": "资源 key → 导航图 → 真机截图的 fast path 全链路"
+      },
+      {
+        "id": "offline-scan",
+        "label": "离线扫描",
+        "focus": ["resolve", "resource_index", "scanner", "ast_engine"],
+        "note": "输入归一化与 Node AST 扫描内核"
+      },
+      {
+        "id": "runtime-fallback",
+        "label": "运行时兜底",
+        "focus": ["shooter", "explorer", "llm", "hdc_driver"],
+        "note": "静态 fast path 失败后的观察-决策-动作闭环"
+      }
+    ]
+  },
+  "components": [
+    { "id": "cli", "type": "frontend", "label": "autoshot CLI", "sublabel": "shoot / capture", "pos": [60, 152], "size": [120, 64] },
+    { "id": "resolve", "type": "backend", "label": "resolve 输入解析", "sublabel": "归一为资源 key", "pos": [250, 152], "size": [140, 64] },
+    { "id": "resource_index", "type": "database", "label": "resource_index", "sublabel": "string.json 索引", "pos": [250, 28], "size": [140, 64] },
+    { "id": "scanner", "type": "backend", "label": "scanner 扫描封装", "sublabel": "AST + regex 兜底", "pos": [448, 152], "size": [140, 64] },
+    { "id": "ast_engine", "type": "backend", "label": "AST 扫描内核", "sublabel": "TS Compiler API", "tag": "tools/*.mjs", "pos": [448, 28], "size": [140, 64] },
+    { "id": "auto_scene", "type": "backend", "label": "auto_scene 推导", "sublabel": "导航图 BFS 步骤", "pos": [636, 152], "size": [140, 64] },
+    { "id": "navigator", "type": "backend", "label": "navigator 执行", "sublabel": "launch/click/swipe", "pos": [840, 152], "size": [140, 64] },
+    { "id": "shooter", "type": "backend", "label": "shooter 滚动截屏", "sublabel": "滚动 · screenCap", "pos": [1049, 152], "size": [130, 64] },
+    { "id": "hdc_driver", "type": "backend", "label": "hdc_driver", "sublabel": "dumpLayout · uiInput", "pos": [840, 276], "size": [140, 64] },
+    { "id": "device", "type": "external", "label": "鸿蒙真机", "sublabel": "HarmonyOS · TestApp", "pos": [634, 276], "size": [140, 64] },
+    { "id": "explorer", "type": "backend", "label": "explorer 兜底", "sublabel": "观察→决策→动作", "pos": [1044, 276], "size": [140, 64] },
+    { "id": "llm", "type": "cloud", "label": "LLM 视觉决策", "sublabel": "未配置自动跳过", "pos": [1049, 400], "size": [130, 64] },
+    { "id": "report", "type": "backend", "label": "report 总结报告", "sublabel": "markdown + json", "pos": [250, 400], "size": [140, 64] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "离线解析与静态扫描", "wraps": ["resolve", "resource_index", "scanner", "ast_engine"], "pad": 16 },
+    { "kind": "region", "label": "运行时执行（宿主侧）", "wraps": ["navigator", "shooter", "hdc_driver", "explorer"], "pad": 16 }
+  ],
+  "connections": [
+    { "id": "cli-resolve", "from": "cli", "to": "resolve", "label": "shoot", "variant": "emphasis" },
+    { "id": "resolve-index", "from": "resolve", "to": "resource_index", "label": "文案反查" },
+    { "id": "resolve-scanner", "from": "resolve", "to": "scanner", "label": "资源 key" },
+    { "id": "scanner-ast", "from": "scanner", "to": "ast_engine", "label": "spawn node" },
+    { "id": "scanner-scene", "from": "scanner", "to": "auto_scene", "label": "导航图" },
+    { "id": "scene-nav", "from": "auto_scene", "to": "navigator", "label": "场景步骤" },
+    { "id": "nav-shooter", "from": "navigator", "to": "shooter", "label": "页面就绪" },
+    { "id": "nav-hdc", "from": "navigator", "to": "hdc_driver", "label": "uiInput", "fromSide": "bottom", "toSide": "top", "labelAt": [880, 230] },
+    { "id": "shooter-hdc", "from": "shooter", "to": "hdc_driver", "label": "滚动 · 截屏", "fromSide": "bottom", "toSide": "top" },
+    { "id": "hdc-device", "from": "hdc_driver", "to": "device", "label": "hdc", "fromSide": "left", "toSide": "right" },
+    { "id": "shooter-explorer", "from": "shooter", "to": "explorer", "label": "静态路径失败", "variant": "dashed", "labelAt": [1114, 262] },
+    { "id": "explorer-llm", "from": "explorer", "to": "llm", "label": "视觉决策", "variant": "dashed", "labelAt": [1114, 372] },
+    { "id": "explorer-hdc", "from": "explorer", "to": "hdc_driver", "label": "白盒注入", "variant": "dashed", "fromSide": "left", "toSide": "right" },
+    { "id": "cli-report", "from": "cli", "to": "report", "label": "结果汇总" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "离线静态分析", "items": ["resolve 将 name / 文案 / 截图 OCR 归一为资源 key", "TS Compiler API 规则匹配 + 谓词求值，增量缓存万级 0.32s"] },
+    { "dot": "emerald", "title": "真机执行 fast path", "items": ["auto_scene BFS 推导步骤，navigator 执行后 shooter 滚动截屏", "设备交互统一走 hdc_driver，需 DevEco 自带 hdc 3.2.0c"] },
+    { "dot": "amber", "title": "运行时兜底", "items": ["fast path 失败时 explorer 以观察→决策→动作闭环接管", "llm 视觉判下一步（未配置跳过），inject 以 Want 直达路由"] },
+    { "dot": "slate", "title": "输出与边界", "items": ["report 汇总成功/失败，输出 markdown + json", "异步/服务端下发与 SECURE 隐私页是硬边界"] }
+  ]
+}

@@ -40,3 +40,6 @@ TestApp/build-profile.json5
 
 # ---- macOS ----
 .DS_Store
+
+# archify visual-check 截图/回执等临时证据文件
+diagrams/*.visual-check.*
