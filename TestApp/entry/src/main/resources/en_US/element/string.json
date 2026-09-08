@@ -37,6 +37,9 @@
     { "name": "nav_route_a", "value": "Entered Route A" },
     { "name": "nav_route_b", "value": "Entered Route B" },
     { "name": "nav_entry", "value": "Nav Entry" },
+    { "name": "nav_stream", "value": "Streaming Text & Dots Loading" },
+    { "name": "stream_title", "value": "Streaming Text Demo" },
+    { "name": "stream_replay", "value": "Replay" },
     { "name": "nav_entry_title", "value": "Nav Entry Page" },
     { "name": "nav_entry_hint", "value": "Tap list items below" },
     { "name": "unused_string", "value": "Nobody references me" }

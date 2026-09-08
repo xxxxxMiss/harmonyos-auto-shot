@@ -5,6 +5,7 @@
     "pages/ListPage",
     "pages/StatePage",
     "pages/DetailPage",
-    "pages/NavEntryPage"
+    "pages/NavEntryPage",
+    "pages/StreamingDotsPage"
   ]
 }

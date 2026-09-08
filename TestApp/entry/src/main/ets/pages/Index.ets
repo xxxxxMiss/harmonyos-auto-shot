@@ -47,6 +47,11 @@ struct Index {
         .onClick(() => {
           router.pushUrl({ url: 'pages/NavEntryPage' })
         })
+      Button($r('app.string.nav_stream'))
+        .width('80%')
+        .onClick(() => {
+          router.pushUrl({ url: 'pages/StreamingDotsPage' })
+        })
     }
     .width('100%')
     .height('100%')

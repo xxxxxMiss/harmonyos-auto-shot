@@ -37,6 +37,9 @@
     { "name": "nav_route_a", "value": "进入了路由A" },
     { "name": "nav_route_b", "value": "进入了路由B" },
     { "name": "nav_entry", "value": "导航入口" },
+    { "name": "nav_stream", "value": "流式文本与点阵加载" },
+    { "name": "stream_title", "value": "流式文本演示" },
+    { "name": "stream_replay", "value": "重新播放" },
     { "name": "nav_entry_title", "value": "导航入口页" },
     { "name": "nav_entry_hint", "value": "点击下方列表项" },
     { "name": "unused_string", "value": "没有任何页面引用我" }
