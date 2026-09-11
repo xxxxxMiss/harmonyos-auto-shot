@@ -1,7 +1,7 @@
 // 偏移列表页：List 配置 contentStartOffset / contentEndOffset + 底部固定按钮
 //
 // 场景：contentEndOffset 被**故意设置得很大**（见 CONTENT_END_OFFSET）。
-// 因此框架意义上的"真正底部"（scrollEdge(Edge.Bottom) / onReachEnd 到达的位置）
+// 因此框架意义上的"真正底部"（onReachEnd / 直接滚到最大偏移所到达的位置）
 // 并不是我们要的底部——停在那个位置时，末条离按钮还有一大截空白。
 //
 // 本页要验证的"底部" = 最后一条记录刚好处在底部按钮上方。
@@ -50,6 +50,10 @@ const PAGE_SIZE: number = 10;
 const PULL_DOWN_THRESHOLD: number = 20;
 /** 自动滚回"有效底部"的动画时长（ms） */
 const BOUNCE_DURATION: number = 260;
+/** 首屏"拉到真正底部"用的目标偏移（vp）：给个足够大的值，由框架自动钳位到最大偏移 */
+const INITIAL_SCROLL_TARGET: number = 100000;
+/** 首屏"拉到真正底部"的动画时长（ms） */
+const INITIAL_SCROLL_DURATION: number = 300;
 /** 判定"已经在正确位置"的容差（vp） */
 const OVERFLOW_TOLERANCE: number = 0.5;
 
@@ -72,9 +76,14 @@ struct OffsetListPage {
   private reachedRealEnd: boolean = false;
   /** 顶部往回滚的累加距离（vp） */
   private pullAccum: number = 0;
-  /** 上一次发起修正时的偏移 / 目标偏移，用于识别"被滚动范围夹住"并终止重试 */
-  private lastSnapFrom: number = -1;
-  private lastSnapTo: number = -1;
+  /**
+   * 上一次发起的修正"期望落到的偏移"，-1 表示没有待确认的修正。
+   * 下一次滚动停下来时拿实际偏移跟它比对：对上了说明修正生效；对不上说明被滚动范围夹住，
+   * 本次就不再重试（同一手势内不叠加修正，杜绝"修正->滚动->再修正"死循环）。
+   */
+  private pendingTarget: number = -1;
+  /** 首屏那次滚动是不是我们自己发起的（决定是否强制修正） */
+  private awaitingInitialSettle: boolean = false;
 
   aboutToAppear(): void {
     const arr: string[] = [];
@@ -126,6 +135,26 @@ struct OffsetListPage {
     if (this.items.length === 0) {
       return;
     }
+    let current: number = 0;
+    try {
+      current = this.scroller.currentOffset().yOffset;
+    } catch (err) {
+      return;
+    }
+
+    // 先给上一次修正结账：落位了才允许发起新的修正。
+    // 关键点：这个判断只看"本次实际偏移有没有到达上次的目标"，
+    // 不做跨手势的位置比对——否则用户再次滚到同一个底部位置时会被误判成"没进展"而不再回弹。
+    if (this.pendingTarget >= 0) {
+      const landed: boolean = Math.abs(current - this.pendingTarget) <= OVERFLOW_TOLERANCE;
+      this.pendingTarget = -1;
+      if (!landed) {
+        // 上一次修正没有落位 -> 被滚动范围夹住，本次不再重试
+        this.statusText = '已到滚动极限，无法再往上收回';
+        return;
+      }
+    }
+
     const overflow: number = this.measureOverflow();
     let delta: number = 0;
     if (Number.isNaN(overflow)) {
@@ -147,12 +176,6 @@ struct OffsetListPage {
       delta = overflow;
     }
 
-    let current: number = 0;
-    try {
-      current = this.scroller.currentOffset().yOffset;
-    } catch (err) {
-      return;
-    }
     let target: number = current + delta;
     if (target < 0) {
       target = 0;
@@ -161,15 +184,7 @@ struct OffsetListPage {
       // 目标位置就是当前位置（已被内容边界夹住），无需滚动
       return;
     }
-    if (this.lastSnapFrom >= 0
-      && Math.abs(current - this.lastSnapFrom) <= OVERFLOW_TOLERANCE
-      && Math.abs(current - this.lastSnapTo) > OVERFLOW_TOLERANCE) {
-      // 上一次从同一位置发起的修正没有产生任何位移 -> 被滚动范围夹住，不再重试
-      this.statusText = `已到滚动极限 · 还需修正 ${delta.toFixed(0)}vp`;
-      return;
-    }
-    this.lastSnapFrom = current;
-    this.lastSnapTo = target;
+    this.pendingTarget = target;
     this.statusText = `自动滚回底部 · 修正 ${delta.toFixed(0)}vp`;
     this.scroller.scrollTo({
       xOffset: 0,
@@ -186,8 +201,7 @@ struct OffsetListPage {
       fresh.push(`下拉加载第${this.batchNo}批 · ${i}/${PAGE_SIZE}`);
     }
     this.items = fresh.concat(this.items);
-    this.lastSnapFrom = -1;
-    this.lastSnapTo = -1;
+    this.pendingTarget = -1;
     this.statusText = `已加载 ${this.batchNo * PAGE_SIZE} 条 · 当前共 ${this.items.length} 条`;
   }
 
@@ -264,18 +278,26 @@ struct OffsetListPage {
         .scrollBar(BarState.Auto)
         .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
         .onAppear(() => {
-          // 首屏直接拉到框架意义上的"真正底部"；
-          // 滚动停下来后由 onScrollStop 自动收回到"有效底部"，不靠定时器
+          // 首屏拉到框架意义上的"真正底部"。
+          // 这里必须用带动画的 scrollTo，而不是 scrollEdge：
+          // scrollEdge 是瞬时跳转，不产生滚动停止事件，收不到 onScrollStop，
+          // 结果就会一直停在"真正底部"（末条离按钮还有 contentEndOffset 那么远）。
+          // scrollTo 的动画结束一定会触发 onScrollStop，在那里再收回到"有效底部"。
           if (this.initialScrolled) {
             return;
           }
           this.initialScrolled = true;
-          this.lastSnapFrom = -1;
-          this.lastSnapTo = -1;
+          this.pendingTarget = -1;
+          this.awaitingInitialSettle = true;
           try {
-            this.scroller.scrollEdge(Edge.Bottom);
+            this.scroller.scrollTo({
+              xOffset: 0,
+              yOffset: INITIAL_SCROLL_TARGET,
+              animation: { duration: INITIAL_SCROLL_DURATION, curve: Curve.EaseOut }
+            });
           } catch (err) {
             this.initialScrolled = false;
+            this.awaitingInitialSettle = false;
           }
         })
         // 到达框架意义上的底部：先记标记，等滚动停下来再统一修正
@@ -303,8 +325,10 @@ struct OffsetListPage {
         // 只要落点越过"有效底部"就自动收回来。放在这里而不是 onReachEnd，
         // 是为了不打断进行中的甩动动画。
         .onScrollStop(() => {
-          const force: boolean = this.reachedRealEnd;
+          // 首屏那次是我们自己发起的，必然停在"真正底部"，强制修正
+          const force: boolean = this.reachedRealEnd || this.awaitingInitialSettle;
           this.reachedRealEnd = false;
+          this.awaitingInitialSettle = false;
           this.pullAccum = 0;
           this.settleAtEffectiveBottom(true, force);
         })
