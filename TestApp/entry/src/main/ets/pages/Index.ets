@@ -37,6 +37,11 @@ struct Index {
         .onClick(() => {
           router.pushUrl({ url: 'pages/ListPage' })
         })
+      Button($r('app.string.nav_offset_list'))
+        .width('80%')
+        .onClick(() => {
+          router.pushUrl({ url: 'pages/OffsetListPage' })
+        })
       Button($r('app.string.nav_state'))
         .width('80%')
         .onClick(() => {

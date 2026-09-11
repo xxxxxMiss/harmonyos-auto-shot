@@ -42,6 +42,8 @@
     { "name": "stream_replay", "value": "Replay" },
     { "name": "nav_entry_title", "value": "Nav Entry Page" },
     { "name": "nav_entry_hint", "value": "Tap list items below" },
+    { "name": "nav_offset_list", "value": "Open Offset List" },
+    { "name": "offset_bottom_button", "value": "Fixed Bottom Button (does not scroll)" },
     { "name": "unused_string", "value": "Nobody references me" }
   ]
 }

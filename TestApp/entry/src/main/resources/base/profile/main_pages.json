@@ -3,6 +3,7 @@
     "pages/Index",
     "pages/SettingsPage",
     "pages/ListPage",
+    "pages/OffsetListPage",
     "pages/StatePage",
     "pages/DetailPage",
     "pages/NavEntryPage",
