@@ -25,22 +25,56 @@ const ITEM_SPACE: number = 10;
 const BUTTON_HEIGHT: number = 44;
 /** 按钮距列表底边的 margin（vp） */
 const BUTTON_BOTTOM_MARGIN: number = 24;
-/** 末条底边与按钮顶边之间保留的间隙（vp） */
-const LAST_ITEM_GAP: number = 12;
+
+/** "内容由AI生成"提示条高度（vp，含流光边框） */
+const DISCLAIMER_HEIGHT: number = 30;
+/** 提示条圆角（vp） */
+const DISCLAIMER_RADIUS: number = 15;
+/** 流光边框宽度（vp） */
+const DISCLAIMER_BORDER: number = 1.5;
+/** 提示条底边与按钮顶边之间的间隙（vp） */
+const DISCLAIMER_BOTTOM_GAP: number = 10;
+/** 提示条相对列表底边的 margin：正好落在按钮正上方 */
+const DISCLAIMER_MARGIN: number = BUTTON_HEIGHT + BUTTON_BOTTOM_MARGIN + DISCLAIMER_BOTTOM_GAP;
+/** 末条底边与提示条顶边之间保留的间隙（vp） */
+const LAST_ITEM_GAP: number = 24;
 
 /**
  * 末条量不到时的兜底内缩量（vp）。正常路径不需要它：
- * 修正距离由"末条实测坐标"和"按钮实测坐标"直接相减得到，与列表高度无关。
+ * 修正距离由"末条实测坐标"和"按钮实测坐标"相减得到，与列表高度无关。
+ * 安全线 = 提示条顶边 - LAST_ITEM_GAP，展开就是下面这个式子。
  */
-const FALLBACK_INSET: number = BUTTON_HEIGHT + BUTTON_BOTTOM_MARGIN + LAST_ITEM_GAP;
+const FALLBACK_INSET: number = DISCLAIMER_MARGIN + DISCLAIMER_HEIGHT + LAST_ITEM_GAP;
+
+/**
+ * 提示条显隐判定，只看"末条底边"和提示条的位置关系：
+ *   末条底边还在提示条底边下方超过 APPROACH  -> 还没滚到，显示
+ *   末条底边高出提示条顶边 CLEAR 之上         -> 已经被拉上去了，显示
+ *   两者之间（正经过 / 停在提示条上）         -> 隐藏
+ * 两个阈值留出滞回区间，避免甩动时反复闪。
+ */
+const DISCLAIMER_APPROACH: number = 24;
+const DISCLAIMER_CLEAR: number = 12;
+/** 提示条显隐动效时长（ms） */
+const DISCLAIMER_ANIM_DURATION: number = 220;
+
+/** 流光扫光单圈时长（ms）与起止位移 */
+const SHIMMER_DURATION: number = 1600;
+const SHINE_START: string = '-100%';
+const SHINE_END: string = '100%';
 
 /** 内容区起始偏移量（vp） */
 const CONTENT_START_OFFSET: number = 24;
 /**
- * 内容区末尾偏移量（vp）——故意设置得很大（是兜底内缩量的 3 倍多），
- * 用来验证框架"真正底部"远离"有效底部"时，如何自动把多余空白收回来。
+ * 内容区末尾偏移量（vp）——故意设置得很大，用来验证框架"真正底部"远离"有效底部"时，
+ * 如何自动把多余空白收回来。
+ *
+ * 这个值同时决定了回弹距离：
+ *     回弹距离 = CONTENT_END_OFFSET - FALLBACK_INSET
+ * 当前 = 520 - 132 = 388vp，滚到"真正底部"后会被一次性收回这么多，肉眼很容易看出来。
+ * 想调回弹幅度改这里即可（调小会让回弹变得不明显）。
  */
-const CONTENT_END_OFFSET: number = 270;
+const CONTENT_END_OFFSET: number = 520;
 
 /** 初始 Mock 数据条数 */
 const INITIAL_COUNT: number = 30;
@@ -48,8 +82,8 @@ const INITIAL_COUNT: number = 30;
 const PAGE_SIZE: number = 10;
 /** 在顶部继续往回滚的累加阈值（vp），超过就加载下一页 */
 const PULL_DOWN_THRESHOLD: number = 20;
-/** 自动滚回"有效底部"的动画时长（ms） */
-const BOUNCE_DURATION: number = 260;
+/** 回弹动画时长（ms）：太短会看成瞬间跳变，看不出"回弹"过程 */
+const BOUNCE_DURATION: number = 420;
 /** 首屏"拉到真正底部"用的目标偏移（vp）：给个足够大的值，由框架自动钳位到最大偏移 */
 const INITIAL_SCROLL_TARGET: number = 100000;
 /** 首屏"拉到真正底部"的动画时长（ms） */
@@ -61,6 +95,8 @@ const OVERFLOW_TOLERANCE: number = 0.5;
 const LIST_ID: string = 'offset_list';
 const LAST_ITEM_ID: string = 'offset_last_item';
 const BUTTON_ID: string = 'offset_bottom_button';
+/** 提示条不参与几何换算（位置由按钮锚点推出），id 仅用于调试定位 */
+const DISCLAIMER_ID: string = 'offset_disclaimer';
 
 @Entry
 @Component
@@ -85,6 +121,20 @@ struct OffsetListPage {
   /** 首屏那次滚动是不是我们自己发起的（决定是否强制修正） */
   private awaitingInitialSettle: boolean = false;
 
+  /** 提示条是否显示（默认显示，对应"静止在有效底部"的状态） */
+  @State disclaimerVisible: boolean = true;
+  /**
+   * 提示条是否已经"让位"。
+   * 上闩之后，末条一路往列表下方走都不再冒出来，只有末条重新回到提示条上方才解锁。
+   */
+  private disclaimerLatched: boolean = false;
+  /** 流光高光的水平位移，靠它扫出"流光"效果 */
+  @State shineX: string = SHINE_START;
+  /** 流光动画是否已经启动过 */
+  private shimmerStarted: boolean = false;
+  /** 底部按钮顶边的窗口坐标（px）；-1 表示还没量到。按钮一直在，作为几何锚点 */
+  private buttonTopPx: number = -1;
+
   aboutToAppear(): void {
     const arr: string[] = [];
     for (let i = 1; i <= INITIAL_COUNT; i++) {
@@ -95,32 +145,134 @@ struct OffsetListPage {
   }
 
   /**
-   * 实测末条底边越过"按钮顶边 - 间隙"的距离（vp）。
-   *
-   * 直接拿两个组件的实测坐标相减，不依赖列表高度：
-   * getRectangleById 拿到的是组件当前所在位置（px，窗口坐标系），
-   * 相减得到需要滚动的像素量，再用 px2vp 换成 scrollTo 需要的 vp。
-   * 返回 NaN 表示量不到（未布局 / 已滚出显示区）。
+   * 量一次底部按钮的位置并缓存为几何锚点。
+   * 按钮一直在（不像提示条会被 if 摘掉），所以任何时候都能量到；
+   * 提示条和安全线的位置都由它换算出来，也就不用再维护列表高度。
    */
-  private measureOverflow(): number {
+  private ensureAnchor(): boolean {
+    if (this.buttonTopPx >= 0) {
+      return true;
+    }
     try {
-      const ui = this.getUIContext();
-      const utils = ui.getComponentUtils();
-      const lastItem = utils.getRectangleById(LAST_ITEM_ID);
-      const button = utils.getRectangleById(BUTTON_ID);
-      if (lastItem.size.height <= 0 || button.size.height <= 0) {
+      const button = this.getUIContext().getComponentUtils().getRectangleById(BUTTON_ID);
+      if (button.size.height <= 0) {
+        return false;
+      }
+      this.buttonTopPx = button.windowOffset.y;
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /** 实测末条底边的窗口坐标（px），量不到返回 NaN */
+  private measureLastItemBottomPx(): number {
+    try {
+      const item = this.getUIContext().getComponentUtils().getRectangleById(LAST_ITEM_ID);
+      if (item.size.height <= 0) {
         return Number.NaN;
       }
-      const itemBottomPx: number = lastItem.windowOffset.y + lastItem.size.height;
-      const safeBottomPx: number = button.windowOffset.y - ui.vp2px(LAST_ITEM_GAP);
-      return ui.px2vp(itemBottomPx - safeBottomPx);
+      return item.windowOffset.y + item.size.height;
     } catch (err) {
       return Number.NaN;
     }
   }
 
   /**
-   * 把列表停到"有效底部"：末条底边刚好落在按钮上方（留 LAST_ITEM_GAP 间隙）。
+   * 实测末条底边越过"安全线"的距离（vp）。
+   * 安全线 = 提示条顶边 - LAST_ITEM_GAP，也就是末条刚好停在提示条上方时底边的位置。
+   * 返回 NaN 表示量不到（未布局 / 已滚出显示区）。
+   */
+  private measureOverflow(): number {
+    if (!this.ensureAnchor()) {
+      return Number.NaN;
+    }
+    const itemBottomPx: number = this.measureLastItemBottomPx();
+    if (Number.isNaN(itemBottomPx)) {
+      return Number.NaN;
+    }
+    const ui = this.getUIContext();
+    const safeBottomPx: number = this.buttonTopPx
+      - ui.vp2px(DISCLAIMER_MARGIN)
+      - ui.vp2px(LAST_ITEM_GAP);
+    return ui.px2vp(itemBottomPx - safeBottomPx);
+  }
+
+  /**
+   * 根据末条位置更新提示条显隐（带"让位"闩锁）。
+   *
+   * 判定只看末条底边 d 相对提示条底边的位置：
+   *   d 高出提示条顶边 CLEAR 之上（末条在提示条上方）  -> 显示，解锁
+   *   d 落在 APPROACH 以内（接近/经过/停在提示条上）    -> 隐藏，上闩
+   *   d 还在更下方                                     -> 保持隐藏状态（上过闩就不再冒头）
+   *
+   * 上闩是关键：末条往下走穿过提示条后，它会继续往列表下方跑，
+   * 如果没有闩，d 变大又会满足"显示"条件，就出现"先消失再冒出来"的抖动。
+   */
+  private updateDisclaimerVisibility(): void {
+    if (!this.ensureAnchor()) {
+      return;
+    }
+    const itemBottomPx: number = this.measureLastItemBottomPx();
+    if (Number.isNaN(itemBottomPx)) {
+      return;
+    }
+    const ui = this.getUIContext();
+    const disclaimerBottomPx: number = this.buttonTopPx - ui.vp2px(DISCLAIMER_BOTTOM_GAP);
+    const heightPx: number = ui.vp2px(DISCLAIMER_HEIGHT);
+    // d > 0：末条底边还在提示条底边下方；d < 0：已经升到提示条底边之上
+    const d: number = itemBottomPx - disclaimerBottomPx;
+    if (d <= -(heightPx + ui.vp2px(DISCLAIMER_CLEAR))) {
+      // 末条已经回到提示条上方 -> 恢复显示，并解除"让位"状态
+      this.disclaimerLatched = false;
+      this.disclaimerVisible = true;
+    } else if (d <= ui.vp2px(DISCLAIMER_APPROACH)) {
+      // 接近 / 正经过 / 停在提示条上 -> 隐藏，并上闩
+      this.disclaimerLatched = true;
+      this.disclaimerVisible = false;
+    } else {
+      // 末条还在提示条下方：只有从没让过位才显示。
+      // 这是"继续往下滑不能出现"的关键——让位之后一路往下都不再冒头，
+      // 必须等末条被拉回提示条上方才恢复。
+      this.disclaimerVisible = !this.disclaimerLatched;
+    }
+  }
+
+  /** 启动流光：高光带在边框里来回扫 */
+  private startShimmer(): void {
+    if (this.shimmerStarted) {
+      return;
+    }
+    this.shimmerStarted = true;
+    this.shineX = SHINE_START;
+    this.getUIContext().animateTo({
+      duration: SHIMMER_DURATION,
+      curve: Curve.Linear,
+      iterations: -1
+    }, () => {
+      this.shineX = SHINE_END;
+    });
+  }
+
+  /** 提示条上的流光高光层：铺满整条，靠位移扫过去 */
+  @Builder
+  disclaimerShine() {
+    Row()
+      .width('100%')
+      .height('100%')
+      .translate({ x: this.shineX })
+      .linearGradient({
+        angle: 90,
+        colors: [
+          ['rgba(255,255,255,0)', 0.0],
+          ['rgba(255,255,255,0.9)', 0.5],
+          ['rgba(255,255,255,0)', 1.0]
+        ]
+      })
+  }
+
+  /**
+   * 把列表停到"有效底部"：末条底边刚好落在提示条上方（留 LAST_ITEM_GAP 间隙）。
    *
    * contentEndOffset 很大时，"真正底部"会让末条离按钮很远；反过来末条也可能被
    * 按钮压住。两种偏差都用同一个位移修正：
@@ -289,6 +441,7 @@ struct OffsetListPage {
           this.initialScrolled = true;
           this.pendingTarget = -1;
           this.awaitingInitialSettle = true;
+          this.startShimmer();
           try {
             this.scroller.scrollTo({
               xOffset: 0,
@@ -309,6 +462,8 @@ struct OffsetListPage {
           if (this.scroller.isAtEnd()) {
             this.reachedRealEnd = true;
           }
+          // 每帧按末条位置刷新提示条显隐（表冠 / 触摸 / 惯性都会走到这里）
+          this.updateDisclaimerVisibility();
           if (scrollOffset < 0 && this.isAtTop()) {
             // 已经在顶部还继续往回滚 -> 累加下拉距离
             this.pullAccum -= scrollOffset;
@@ -331,7 +486,43 @@ struct OffsetListPage {
           this.awaitingInitialSettle = false;
           this.pullAccum = 0;
           this.settleAtEffectiveBottom(true, force);
+          this.updateDisclaimerVisibility();
         })
+
+        // "内容由AI生成"提示条：位于底部按钮正上方。
+        // 末条升到它跟前时整条淡出+下移让位，末条被拉上去之后再回来。
+        if (this.disclaimerVisible) {
+          Row() {
+            Text($r('app.string.ai_generated_disclaimer'))
+              .fontSize(12)
+              .fontColor('#6D28D9')
+              .textAlign(TextAlign.Center)
+              .height(DISCLAIMER_HEIGHT - DISCLAIMER_BORDER * 2)
+              .padding({ left: 12, right: 12 })
+              .backgroundColor('#FFFFFF')
+              .borderRadius(DISCLAIMER_RADIUS - DISCLAIMER_BORDER)
+          }
+          .padding(DISCLAIMER_BORDER)
+          .borderRadius(DISCLAIMER_RADIUS)
+          // 边框底色：多色线性渐变
+          .linearGradient({
+            angle: 90,
+            colors: [['#60A5FA', 0.0], ['#A78BFA', 0.33], ['#F472B6', 0.66], ['#FBBF24', 1.0]]
+          })
+          .clip(true)
+          // 叠一层扫动的白色高光 -> 渐变边框流光
+          .overlay(this.disclaimerShine())
+          .id(DISCLAIMER_ID)
+          .margin({ bottom: DISCLAIMER_MARGIN })
+          .transition(
+            TransitionEffect.OPACITY
+              .animation({ duration: DISCLAIMER_ANIM_DURATION, curve: Curve.EaseOut })
+              .combine(
+                TransitionEffect.translate({ y: 12 })
+                  .animation({ duration: DISCLAIMER_ANIM_DURATION, curve: Curve.EaseOut })
+              )
+          )
+        }
 
         // 底部固定按钮：悬浮在 List 之上，不随列表滑动
         Button($r('app.string.offset_bottom_button'))

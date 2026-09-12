@@ -42,6 +42,7 @@
     { "name": "stream_replay", "value": "重新播放" },
     { "name": "nav_entry_title", "value": "导航入口页" },
     { "name": "nav_entry_hint", "value": "点击下方列表项" },
+    { "name": "ai_generated_disclaimer", "value": "内容由AI生成" },
     { "name": "nav_offset_list", "value": "偏移列表（触底回弹）" },
     { "name": "offset_bottom_button", "value": "底部固定按钮（不随列表滚动）" },
     { "name": "unused_string", "value": "没有任何页面引用我" }
