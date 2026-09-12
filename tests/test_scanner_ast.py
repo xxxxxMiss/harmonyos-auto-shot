@@ -92,6 +92,7 @@ def _testapp_scan():
     pages = {p["name"]: p["depth"] for p in scan.pages}
     assert pages == {"pages/Index": 0, "pages/SettingsPage": 1, "pages/ListPage": 1,
                      "pages/OffsetListPage": 1,
+                     "pages/ColorBorderPage": 1,
                      "pages/StatePage": 1, "pages/DetailPage": 2, "pages/NavEntryPage": 1,
                      "pages/StreamingDotsPage": 1,
                      "NavDetailPage": 2, "NavRouteAPage": 2, "NavRouteBPage": 2}
@@ -109,6 +110,7 @@ def test_testapp_push_url_edges():
     scan = _testapp_scan()
     targets = {e["to"] for e in scan.edges if e["api"] == "pushUrl"}
     assert targets == {"pages/SettingsPage", "pages/ListPage", "pages/OffsetListPage",
+                       "pages/ColorBorderPage",
                        "pages/StatePage",
                        "pages/DetailPage", "pages/NavEntryPage", "pages/StreamingDotsPage"}
 

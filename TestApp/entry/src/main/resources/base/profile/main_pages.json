@@ -4,6 +4,7 @@
     "pages/SettingsPage",
     "pages/ListPage",
     "pages/OffsetListPage",
+    "pages/ColorBorderPage",
     "pages/StatePage",
     "pages/DetailPage",
     "pages/NavEntryPage",
