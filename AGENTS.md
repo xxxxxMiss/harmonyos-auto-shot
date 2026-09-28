@@ -57,6 +57,9 @@ node tools/ast_scan.mjs TestApp /tmp/out.json   # 直接调内核
 .venv/bin/python -m autoshot capture -p TestApp <name...> --out-dir shots
 .venv/bin/python -m autoshot capture -p TestApp --image shot.png   # 截图反查
 
+# 穿戴（圆屏）真机验证：OffsetListPage 的"有效底部"行为，产物在 watch_verify/
+.venv/bin/python tools/verify_wearable_offset.py --out-dir watch_verify
+
 # TestApp 构建（macOS，DevEco Studio 6.x）
 cd TestApp && export DEVECO_SDK_HOME="/Applications/DevEco-Studio.app/Contents/sdk"
 "/Applications/DevEco-Studio.app/Contents/tools/node/bin/node" \
@@ -73,6 +76,10 @@ cd TestApp && export DEVECO_SDK_HOME="/Applications/DevEco-Studio.app/Contents/s
 - **screenCap 异步写盘有竞态**：固定路径残留旧文件会被 recv 拉回，已改为"删旧文件→截屏→轮询拉取"。
 - **设备 USB 连接反复掉线**：真机验证前先 `hdc list targets` 确认设备在线。
 - **隐私页禁止截屏（SECURE）**会得到黑图，驱动会显式报错。
+- **`contentStartOffset` + `contentEndOffset` 之和不能超过 List 显示区高度**：超过时框架把两者**静默置 0**（文档："超过 List 内容区长度后置 0"，实测比对的是显示区高度）。手表圆屏列表区只有 211vp，`OffsetListPage` 原先取 `12+200=212` 直接失效——`contentEndOffset` 完全不产生可滚动空间、末条永远贴着列表底边收不回来；改成 `12+160=172` 才正常。手机参数 `24+520=544` 远小于手机列表高度，不受影响。
+- **在 `onScrollStop` 里调 `scroller.scrollTo` 会被框架补发一次 `onScrollStop`**（实测 ~1ms 后），此时偏移还停在原处，任何"目标没达到就放弃"的判定都会误判成"被滚动范围夹住"。`OffsetListPage` 用 `CORRECTION_GUARD_MS`(150ms) 时间窗挡掉动画期内的补发事件。
+- **`getRectangleById()` 的坐标首帧不可信**：布局稳定前量到的按钮位置实测偏高 22vp，缓存下来会永久偏高。要作为几何锚点就得在每次滚动停止后重新量。
+- **圆屏手势坐标要避开悬浮层**：466x466 圆屏上状态条(0~44px)、提示条(294~334px)、底部按钮(346~406px) 都会截走触摸，`uitest uiInput` 划动要落在中间"纯列表带"(约 y 70~280) 才划得动列表。
 
 ## 关键技术决策
 

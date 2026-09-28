@@ -123,6 +123,7 @@ struct StreamingDotsPage {
       Column() {
         Text() {
           Span(this.streamed)
+          ContainerSpan()
           if (this.streaming) {
             Span('●').fontSize(14).letterSpacing(4).fontColor(this.dotColor(0))
             Span('●').fontSize(14).letterSpacing(4).fontColor(this.dotColor(1))

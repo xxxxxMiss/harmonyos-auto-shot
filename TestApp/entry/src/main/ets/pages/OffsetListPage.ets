@@ -1,6 +1,6 @@
 // 偏移列表页：List 配置 contentStartOffset / contentEndOffset + 底部固定按钮
 //
-// 场景：contentEndOffset 被**故意设置得很大**（见 CONTENT_END_OFFSET）。
+// 场景：contentEndOffset 被**故意设置得很大**（见 geom.contentEndOffset）。
 // 因此框架意义上的"真正底部"（onReachEnd / 直接滚到最大偏移所到达的位置）
 // 并不是我们要的底部——停在那个位置时，末条离按钮还有一大截空白。
 //
@@ -12,49 +12,149 @@
 //        末条被按钮压住 -> 往前滚，把它顶上来
 //        末条离按钮太远 -> 往回滚，把多余空白收掉
 //
-// 兼容穿戴设备：全程不用 onTouch（手表上主要是旋转表冠），
-// 滚动一律通过 onDidScroll / onScrollStop 这类滚动事件驱动。
+// 兼容穿戴设备：
+//   - 交互上全程不用 onTouch（手表上主要是旋转表冠），
+//     滚动一律通过 onDidScroll / onScrollStop 这类滚动事件驱动。
+//   - 几何上按设备给两套参数（见 OffsetGeometry）：
+//     手表可用高度只有 ~233vp（HUAWEI WATCH 6：466x466px @2x），
+//     照手机参数（末条 64 + 按钮 44+24 + 提示条 30+8+24）算下来安全线会跑到列表顶部之外，
+//     末条直接被挤没；因此穿戴参数整体收窄，并把控件宽度限制在圆屏内接区域内。
 import { router } from '@kit.ArkUI';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 
-/** 列表项固定高度（vp），固定高度便于按几何关系精确计算修正距离 */
-const ITEM_HEIGHT: number = 64;
-/** 列表项主轴间距（vp） */
-const ITEM_SPACE: number = 10;
-
-/** 底部固定按钮高度（vp） */
-const BUTTON_HEIGHT: number = 44;
-/** 按钮距列表底边的 margin（vp） */
-const BUTTON_BOTTOM_MARGIN: number = 24;
-
-/** "内容由AI生成"提示条高度（vp，含流光边框） */
-const DISCLAIMER_HEIGHT: number = 30;
-/** 提示条圆角（vp） */
-const DISCLAIMER_RADIUS: number = 15;
-/** 流光边框宽度（vp） */
-const DISCLAIMER_BORDER: number = 1.5;
-/** 提示条底边与按钮顶边之间的间隙（vp） */
-const DISCLAIMER_BOTTOM_GAP: number = 10;
-/** 提示条相对列表底边的 margin：正好落在按钮正上方 */
-const DISCLAIMER_MARGIN: number = BUTTON_HEIGHT + BUTTON_BOTTOM_MARGIN + DISCLAIMER_BOTTOM_GAP;
-/** 末条底边与提示条顶边之间保留的间隙（vp） */
-const LAST_ITEM_GAP: number = 24;
+/** 真机排障用日志标签：hdc shell hilog | grep OffSetDbg */
+const DBG_TAG: string = 'OffSetDbg';
+const DBG_DOMAIN: number = 0x0000;
 
 /**
- * 末条量不到时的兜底内缩量（vp）。正常路径不需要它：
- * 修正距离由"末条实测坐标"和"按钮实测坐标"相减得到，与列表高度无关。
- * 安全线 = 提示条顶边 - LAST_ITEM_GAP，展开就是下面这个式子。
+ * 页面几何参数（vp）。
+ *
+ * 修正逻辑本身与这些数值无关（修正量 = 末条实测坐标 - 安全线），
+ * 但"安全线"能不能落在列表可视区内，完全由这些值决定，所以小屏必须给一套小参数。
  */
-const FALLBACK_INSET: number = DISCLAIMER_MARGIN + DISCLAIMER_HEIGHT + LAST_ITEM_GAP;
+interface OffsetGeometry {
+  /** 列表项高度（固定高度便于按几何关系精确计算修正距离） */
+  itemHeight: number;
+  /** 列表项主轴间距 */
+  itemSpace: number;
+  /** 列表项内边距（左右） */
+  itemPadding: number;
+  /** 列表项行内间距 */
+  itemRowSpace: number;
+  /** 列表项正文字号 */
+  itemFontSize: number;
+  /** 序号徽标直径 / 字号 */
+  badgeSize: number;
+  badgeFontSize: number;
+  /** "末条"标记字号 */
+  tagFontSize: number;
+  /** 顶部状态条高度 / 字号 / 宽度 */
+  statusBarHeight: number;
+  statusFontSize: number;
+  statusBarWidth: string;
+  /** 列表左右内缩：圆屏上让整行落在圆内接区域里，避免行首/行尾被圆边裁掉 */
+  listPadding: number;
+  /** 底部固定按钮高度 / 距底边 margin / 宽度 / 字号 */
+  buttonHeight: number;
+  buttonBottomMargin: number;
+  buttonWidth: string;
+  buttonFontSize: number;
+  /** "内容由AI生成"提示条高度（含流光边框）/ 圆角 / 边框宽度 */
+  disclaimerHeight: number;
+  disclaimerRadius: number;
+  disclaimerBorder: number;
+  /** 提示条底边与按钮顶边之间的间隙 */
+  disclaimerBottomGap: number;
+  /** 末条底边与提示条顶边之间保留的间隙 */
+  lastItemGap: number;
+  /** 提示条显隐判定阈值（vp）：接近 / 让开 */
+  disclaimerApproach: number;
+  disclaimerClear: number;
+  /** 内容区起始偏移量 */
+  contentStartOffset: number;
+  /** 内容区末尾偏移量（故意很大，用来验证"有效底部"回滚） */
+  contentEndOffset: number;
+}
+
+/** 手机 / 平板 / 2in1：原参数，保持既有表现 */
+const PHONE_GEOMETRY: OffsetGeometry = {
+  itemHeight: 64,
+  itemSpace: 10,
+  itemPadding: 12,
+  itemRowSpace: 12,
+  itemFontSize: 16,
+  badgeSize: 28,
+  badgeFontSize: 13,
+  tagFontSize: 12,
+  statusBarHeight: 36,
+  statusFontSize: 13,
+  statusBarWidth: '100%',
+  listPadding: 0,
+  buttonHeight: 44,
+  buttonBottomMargin: 24,
+  buttonWidth: '90%',
+  buttonFontSize: 16,
+  disclaimerHeight: 30,
+  disclaimerRadius: 15,
+  disclaimerBorder: 1.5,
+  disclaimerBottomGap: 10,
+  lastItemGap: 24,
+  disclaimerApproach: 24,
+  disclaimerClear: 12,
+  contentStartOffset: 24,
+  contentEndOffset: 520
+};
 
 /**
- * 提示条显隐判定，只看"末条底边"和提示条的位置关系：
- *   末条底边还在提示条底边下方超过 APPROACH  -> 还没滚到，显示
- *   末条底边高出提示条顶边 CLEAR 之上         -> 已经被拉上去了，显示
- *   两者之间（正经过 / 停在提示条上）         -> 隐藏
- * 两个阈值留出滞回区间，避免甩动时反复闪。
+ * 穿戴设备：466x466px @2x = 233x233vp 圆屏（半径 116.5vp，圆心 (116.5,116.5)）。
+ *
+ * 圆屏上"能不能放得下"由内接矩形决定：离圆心垂直距离 d 处只有 2*sqrt(R²-d²) 宽，
+ * 所以越靠上下边缘，可用宽度越窄。下面每个控件都按自己的底边深度验证过：
+ *   状态条  y 0~22   ，y=22 处可用 136vp，取 54%=126vp
+ *   按钮    y 173~203，底边 d=86.5 处可用 156vp，取 66%=154vp（字号 10，文案刚好放得下）
+ *   提示条  y 147~167，d=50.5 处可用 210vp，提示条本身仅约 90vp
+ *   末条    y 99~139 ，d=22.5 处可用 228vp，整条完整可见
+ * 安全线（末条底边落点）= 提示条顶边 147 - lastItemGap 8 = 139vp。
+ * 列表可视区 22~233vp，末条落在中下段最宽处，正是要观察的对象。
+ *
+ * **contentStartOffset + contentEndOffset 必须 ≤ 列表显示区高度**：
+ * 文档写明两者之和超过 List 内容区长度时会被置 0（实测手表上 12+200=212 > 211 就整体失效，
+ * 表现为 contentEndOffset 完全不产生可滚动空间、末条永远贴着列表底边）。手表列表高 211vp，
+ * 所以取 12+160=172，留 39vp 余量；末条贴底时底边在 233-160=73vp，距安全线 66vp，
+ * 回弹一眼可见。
  */
-const DISCLAIMER_APPROACH: number = 24;
-const DISCLAIMER_CLEAR: number = 12;
+const WEARABLE_GEOMETRY: OffsetGeometry = {
+  itemHeight: 40,
+  itemSpace: 6,
+  itemPadding: 8,
+  itemRowSpace: 6,
+  itemFontSize: 12,
+  badgeSize: 20,
+  badgeFontSize: 10,
+  tagFontSize: 9,
+  statusBarHeight: 22,
+  statusFontSize: 9,
+  statusBarWidth: '54%',
+  listPadding: 8,
+  buttonHeight: 30,
+  buttonBottomMargin: 30,
+  buttonWidth: '66%',
+  buttonFontSize: 10,
+  disclaimerHeight: 20,
+  disclaimerRadius: 10,
+  disclaimerBorder: 1,
+  disclaimerBottomGap: 6,
+  lastItemGap: 8,
+  disclaimerApproach: 10,
+  disclaimerClear: 4,
+  contentStartOffset: 12,
+  contentEndOffset: 160
+};
+
+/** 是否穿戴设备：决定用哪套几何参数 */
+const IS_WEARABLE: boolean = deviceInfo.deviceType === 'wearable';
+
 /** 提示条显隐动效时长（ms） */
 const DISCLAIMER_ANIM_DURATION: number = 220;
 
@@ -62,19 +162,6 @@ const DISCLAIMER_ANIM_DURATION: number = 220;
 const SHIMMER_DURATION: number = 1600;
 const SHINE_START: string = '-100%';
 const SHINE_END: string = '100%';
-
-/** 内容区起始偏移量（vp） */
-const CONTENT_START_OFFSET: number = 24;
-/**
- * 内容区末尾偏移量（vp）——故意设置得很大，用来验证框架"真正底部"远离"有效底部"时，
- * 如何自动把多余空白收回来。
- *
- * 这个值同时决定了回弹距离：
- *     回弹距离 = CONTENT_END_OFFSET - FALLBACK_INSET
- * 当前 = 520 - 132 = 388vp，滚到"真正底部"后会被一次性收回这么多，肉眼很容易看出来。
- * 想调回弹幅度改这里即可（调小会让回弹变得不明显）。
- */
-const CONTENT_END_OFFSET: number = 520;
 
 /** 初始 Mock 数据条数 */
 const INITIAL_COUNT: number = 30;
@@ -84,6 +171,15 @@ const PAGE_SIZE: number = 10;
 const PULL_DOWN_THRESHOLD: number = 20;
 /** 回弹动画时长（ms）：太短会看成瞬间跳变，看不出"回弹"过程 */
 const BOUNCE_DURATION: number = 420;
+/**
+ * 修正动画"在飞"的保护窗口（ms）。
+ *
+ * 实测（HUAWEI WATCH 6）：在 onScrollStop 里调 scroller.scrollTo 之后，框架会在 ~1ms 内
+ * 再补发一次 onScrollStop——此时偏移还停在修正前的位置，会被 pendingTarget 结算误判成
+ * "目标没达到（被滚动范围夹住）"，于是本次修正直接放弃，列表永远停在框架真正底部。
+ * 用时间窗把这段动画期内的补发事件挡掉；窗口远小于 BOUNCE_DURATION，不影响真正的落位结算。
+ */
+const CORRECTION_GUARD_MS: number = 150;
 /** 首屏"拉到真正底部"用的目标偏移（vp）：给个足够大的值，由框架自动钳位到最大偏移 */
 const INITIAL_SCROLL_TARGET: number = 100000;
 /** 首屏"拉到真正底部"的动画时长（ms） */
@@ -104,6 +200,8 @@ struct OffsetListPage {
   @State items: string[] = [];
   @State statusText: string = '';
   private scroller: Scroller = new Scroller();
+  /** 当前设备的几何参数 */
+  private geom: OffsetGeometry = IS_WEARABLE ? WEARABLE_GEOMETRY : PHONE_GEOMETRY;
   /** 加载批次计数 */
   private batchNo: number = 0;
   /** 首屏是否已经滚过一次 */
@@ -118,6 +216,8 @@ struct OffsetListPage {
    * 本次就不再重试（同一手势内不叠加修正，杜绝"修正->滚动->再修正"死循环）。
    */
   private pendingTarget: number = -1;
+  /** 上一次发起修正动画的时刻（Date.now()），配合 CORRECTION_GUARD_MS 挡掉动画期的补发事件 */
+  private correctionStartedAt: number = 0;
   /** 首屏那次滚动是不是我们自己发起的（决定是否强制修正） */
   private awaitingInitialSettle: boolean = false;
 
@@ -134,6 +234,8 @@ struct OffsetListPage {
   private shimmerStarted: boolean = false;
   /** 底部按钮顶边的窗口坐标（px）；-1 表示还没量到。按钮一直在，作为几何锚点 */
   private buttonTopPx: number = -1;
+  /** 锚点被实测了几次（排障用） */
+  private anchorMeasureCount: number = 0;
 
   aboutToAppear(): void {
     const arr: string[] = [];
@@ -141,13 +243,43 @@ struct OffsetListPage {
       arr.push(`初始 Mock 数据 #${i}`);
     }
     this.items = arr;
-    this.statusText = `共 ${arr.length} 条 · contentEndOffset=${CONTENT_END_OFFSET}vp`;
+    this.statusText = `共 ${arr.length} 条 · contentEndOffset=${this.geom.contentEndOffset}vp`;
+  }
+
+  /** 提示条相对列表底边的 margin：正好落在按钮正上方 */
+  private disclaimerMargin(): number {
+    return this.geom.buttonHeight + this.geom.buttonBottomMargin + this.geom.disclaimerBottomGap;
+  }
+
+  /**
+   * 安全线相对"按钮顶边"的距离（vp）：
+   * 提示条底边间隙 + 提示条高度 + 末条与提示条顶边的间隙。
+   *
+   * 注意别写成 disclaimerMargin()：那个值里还含 buttonHeight + buttonBottomMargin，
+   * 而按钮顶边本身已经把它们算掉了，重复相减会把安全线凭空抬高
+   * （手机参数下正好抬高 38vp，且与兜底路径 fallbackInset() 自相矛盾）。
+   */
+  private safeLineInsetFromButtonTop(): number {
+    return this.geom.disclaimerBottomGap + this.geom.disclaimerHeight + this.geom.lastItemGap;
+  }
+
+  /**
+   * 末条量不到时的兜底内缩量（vp）：安全线距**屏底**的距离。
+   * 正常路径不需要它（修正距离由末条与按钮的实测坐标相减得到，与列表高度无关），
+   * 只在末条被 contentEndOffset 推出显示区时按配置值推算该收回多少。
+   */
+  private fallbackInset(): number {
+    return this.geom.buttonBottomMargin + this.geom.buttonHeight + this.safeLineInsetFromButtonTop();
   }
 
   /**
    * 量一次底部按钮的位置并缓存为几何锚点。
    * 按钮一直在（不像提示条会被 if 摘掉），所以任何时候都能量到；
    * 提示条和安全线的位置都由它换算出来，也就不用再维护列表高度。
+   *
+   * 注意：**每次滚动停下来都要重新量**（onScrollStop 里失效缓存）。
+   * 首帧的布局还没稳定，那时量到的按钮位置会偏（实测偏 22vp），
+   * 一旦缓存住就永远偏高，末条会被停到错误的位置。
    */
   private ensureAnchor(): boolean {
     if (this.buttonTopPx >= 0) {
@@ -159,6 +291,10 @@ struct OffsetListPage {
         return false;
       }
       this.buttonTopPx = button.windowOffset.y;
+      this.anchorMeasureCount++;
+      hilog.info(DBG_DOMAIN, DBG_TAG,
+        `anchor#${this.anchorMeasureCount}: top=${this.buttonTopPx.toFixed(1)} ` +
+        `h=${button.size.height} screenY=${button.screenOffset.y.toFixed(1)}`);
       return true;
     } catch (err) {
       return false;
@@ -180,31 +316,36 @@ struct OffsetListPage {
 
   /**
    * 实测末条底边越过"安全线"的距离（vp）。
-   * 安全线 = 提示条顶边 - LAST_ITEM_GAP，也就是末条刚好停在提示条上方时底边的位置。
+   * 安全线 = 提示条顶边 - lastItemGap，也就是末条刚好停在提示条上方时底边的位置。
    * 返回 NaN 表示量不到（未布局 / 已滚出显示区）。
    */
   private measureOverflow(): number {
     if (!this.ensureAnchor()) {
+      hilog.info(DBG_DOMAIN, DBG_TAG, 'measure: 量不到按钮锚点');
       return Number.NaN;
     }
     const itemBottomPx: number = this.measureLastItemBottomPx();
+    const ui = this.getUIContext();
+    const safeBottomPx: number = this.buttonTopPx - ui.vp2px(this.safeLineInsetFromButtonTop());
     if (Number.isNaN(itemBottomPx)) {
+      hilog.info(DBG_DOMAIN, DBG_TAG,
+        `measure: 末条量不到 buttonTop=${this.buttonTopPx} safe=${safeBottomPx.toFixed(1)}`);
       return Number.NaN;
     }
-    const ui = this.getUIContext();
-    const safeBottomPx: number = this.buttonTopPx
-      - ui.vp2px(DISCLAIMER_MARGIN)
-      - ui.vp2px(LAST_ITEM_GAP);
-    return ui.px2vp(itemBottomPx - safeBottomPx);
+    const ovf: number = ui.px2vp(itemBottomPx - safeBottomPx);
+    hilog.info(DBG_DOMAIN, DBG_TAG,
+      `measure: itemBottom=${itemBottomPx.toFixed(1)} buttonTop=${this.buttonTopPx.toFixed(1)} ` +
+      `safe=${safeBottomPx.toFixed(1)} overflow=${ovf.toFixed(2)}`);
+    return ovf;
   }
 
   /**
    * 根据末条位置更新提示条显隐（带"让位"闩锁）。
    *
    * 判定只看末条底边 d 相对提示条底边的位置：
-   *   d 高出提示条顶边 CLEAR 之上（末条在提示条上方）  -> 显示，解锁
-   *   d 落在 APPROACH 以内（接近/经过/停在提示条上）    -> 隐藏，上闩
-   *   d 还在更下方                                     -> 保持隐藏状态（上过闩就不再冒头）
+   *   d 高出提示条顶边 clear 之上（末条在提示条上方） -> 显示，解锁
+   *   d 落在 approach 以内（接近/经过/停在提示条上）  -> 隐藏，上闩
+   *   d 还在更下方                                    -> 保持隐藏状态（上过闩就不再冒头）
    *
    * 上闩是关键：末条往下走穿过提示条后，它会继续往列表下方跑，
    * 如果没有闩，d 变大又会满足"显示"条件，就出现"先消失再冒出来"的抖动。
@@ -218,15 +359,15 @@ struct OffsetListPage {
       return;
     }
     const ui = this.getUIContext();
-    const disclaimerBottomPx: number = this.buttonTopPx - ui.vp2px(DISCLAIMER_BOTTOM_GAP);
-    const heightPx: number = ui.vp2px(DISCLAIMER_HEIGHT);
+    const disclaimerBottomPx: number = this.buttonTopPx - ui.vp2px(this.geom.disclaimerBottomGap);
+    const heightPx: number = ui.vp2px(this.geom.disclaimerHeight);
     // d > 0：末条底边还在提示条底边下方；d < 0：已经升到提示条底边之上
     const d: number = itemBottomPx - disclaimerBottomPx;
-    if (d <= -(heightPx + ui.vp2px(DISCLAIMER_CLEAR))) {
+    if (d <= -(heightPx + ui.vp2px(this.geom.disclaimerClear))) {
       // 末条已经回到提示条上方 -> 恢复显示，并解除"让位"状态
       this.disclaimerLatched = false;
       this.disclaimerVisible = true;
-    } else if (d <= ui.vp2px(DISCLAIMER_APPROACH)) {
+    } else if (d <= ui.vp2px(this.geom.disclaimerApproach)) {
       // 接近 / 正经过 / 停在提示条上 -> 隐藏，并上闩
       this.disclaimerLatched = true;
       this.disclaimerVisible = false;
@@ -272,7 +413,7 @@ struct OffsetListPage {
   }
 
   /**
-   * 把列表停到"有效底部"：末条底边刚好落在提示条上方（留 LAST_ITEM_GAP 间隙）。
+   * 把列表停到"有效底部"：末条底边刚好落在提示条上方（留 lastItemGap 间隙）。
    *
    * contentEndOffset 很大时，"真正底部"会让末条离按钮很远；反过来末条也可能被
    * 按钮压住。两种偏差都用同一个位移修正：
@@ -291,8 +432,12 @@ struct OffsetListPage {
     try {
       current = this.scroller.currentOffset().yOffset;
     } catch (err) {
+      hilog.info(DBG_DOMAIN, DBG_TAG, 'settle: currentOffset 取不到');
       return;
     }
+    hilog.info(DBG_DOMAIN, DBG_TAG,
+      `settle: force=${force} cur=${current.toFixed(1)} pending=${this.pendingTarget.toFixed(1)} ` +
+      `items=${this.items.length}`);
 
     // 先给上一次修正结账：落位了才允许发起新的修正。
     // 关键点：这个判断只看"本次实际偏移有没有到达上次的目标"，
@@ -302,9 +447,11 @@ struct OffsetListPage {
       this.pendingTarget = -1;
       if (!landed) {
         // 上一次修正没有落位 -> 被滚动范围夹住，本次不再重试
+        hilog.info(DBG_DOMAIN, DBG_TAG, `settle: 未落位 cur=${current.toFixed(1)}，放弃本次修正`);
         this.statusText = '已到滚动极限，无法再往上收回';
         return;
       }
+      hilog.info(DBG_DOMAIN, DBG_TAG, 'settle: 上次修正已落位，继续');
     }
 
     const overflow: number = this.measureOverflow();
@@ -313,16 +460,19 @@ struct OffsetListPage {
       // 末条量不到（contentEndOffset 太大，已经把它推出显示区）时，
       // 只有确认到达框架底部，才按配置值推算需要收回的距离
       if (!force) {
+        hilog.info(DBG_DOMAIN, DBG_TAG, 'settle: 量不到末条且非强制，不干预');
         return;
       }
-      delta = -(CONTENT_END_OFFSET - FALLBACK_INSET);
+      delta = -(this.geom.contentEndOffset - this.fallbackInset());
     } else {
       if (!force && overflow > OVERFLOW_TOLERANCE) {
         // 末条还在按钮下方且是用户自己停在这里的，说明没滚到"有效底部"，不干预
+        hilog.info(DBG_DOMAIN, DBG_TAG, `settle: 末条在安全线下方 ${overflow.toFixed(1)}vp，不干预`);
         return;
       }
       if (Math.abs(overflow) <= OVERFLOW_TOLERANCE) {
         // 末条已经在按钮上方刚好位置
+        hilog.info(DBG_DOMAIN, DBG_TAG, `settle: 已在有效底部（overflow=${overflow.toFixed(2)}）`);
         return;
       }
       delta = overflow;
@@ -334,10 +484,14 @@ struct OffsetListPage {
     }
     if (Math.abs(target - current) <= OVERFLOW_TOLERANCE) {
       // 目标位置就是当前位置（已被内容边界夹住），无需滚动
+      hilog.info(DBG_DOMAIN, DBG_TAG, `settle: 目标==当前 ${target.toFixed(1)}，无需滚动`);
       return;
     }
     this.pendingTarget = target;
+    this.correctionStartedAt = Date.now();
     this.statusText = `自动滚回底部 · 修正 ${delta.toFixed(0)}vp`;
+    hilog.info(DBG_DOMAIN, DBG_TAG,
+      `settle: 发起修正 delta=${delta.toFixed(1)} target=${target.toFixed(1)} animate=${animate}`);
     this.scroller.scrollTo({
       xOffset: 0,
       yOffset: target,
@@ -355,6 +509,7 @@ struct OffsetListPage {
     this.items = fresh.concat(this.items);
     this.pendingTarget = -1;
     this.statusText = `已加载 ${this.batchNo * PAGE_SIZE} 条 · 当前共 ${this.items.length} 条`;
+    hilog.info(DBG_DOMAIN, DBG_TAG, `loadMore: 第${this.batchNo}批，共 ${this.items.length} 条`);
   }
 
   /** 列表是否停在顶部 */
@@ -368,47 +523,49 @@ struct OffsetListPage {
 
   build() {
     Column() {
-      // 顶部状态条：方便真机核对当前滚动 / 修正结果
+      // 顶部状态条：方便真机核对当前滚动 / 修正结果。
+      // 穿戴设备上收窄到 62% 并居中——圆屏顶部只有中间一条是可见的。
       Row() {
         Text(this.statusText)
-          .fontSize(13)
+          .fontSize(this.geom.statusFontSize)
           .fontColor('#666666')
+          .textAlign(TextAlign.Center)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
-      .width('100%')
-      .height(36)
-      .padding({ left: 16, right: 16 })
+      .width(this.geom.statusBarWidth)
+      .height(this.geom.statusBarHeight)
+      .padding({ left: 8, right: 8 })
       .backgroundColor('#FAFAFA')
 
       Stack({ alignContent: Alignment.Bottom }) {
-        List({ space: ITEM_SPACE, scroller: this.scroller }) {
+        List({ space: this.geom.itemSpace, scroller: this.scroller }) {
           ForEach(this.items, (item: string, idx: number) => {
             ListItem() {
-              Row({ space: 12 }) {
+              Row({ space: this.geom.itemRowSpace }) {
                 Text(`${idx + 1}`)
-                  .fontSize(13)
+                  .fontSize(this.geom.badgeFontSize)
                   .fontColor('#FFFFFF')
                   .textAlign(TextAlign.Center)
-                  .width(28)
-                  .height(28)
-                  .borderRadius(14)
+                  .width(this.geom.badgeSize)
+                  .height(this.geom.badgeSize)
+                  .borderRadius(this.geom.badgeSize / 2)
                   .backgroundColor(idx === this.items.length - 1 ? '#E64545' : '#8C8C8C')
                 Text(item)
-                  .fontSize(16)
+                  .fontSize(this.geom.itemFontSize)
                   .fontColor('#333333')
                   .layoutWeight(1)
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
                 if (idx === this.items.length - 1) {
                   Text('末条')
-                    .fontSize(12)
+                    .fontSize(this.geom.tagFontSize)
                     .fontColor('#E64545')
                 }
               }
               .width('100%')
-              .height(ITEM_HEIGHT)
-              .padding({ left: 12, right: 12 })
+              .height(this.geom.itemHeight)
+              .padding({ left: this.geom.itemPadding, right: this.geom.itemPadding })
               .backgroundColor(idx === this.items.length - 1 ? '#FFF1F0' : '#F2F3F5')
               .borderRadius(8)
               .border({
@@ -422,11 +579,13 @@ struct OffsetListPage {
         }
         .width('100%')
         .height('100%')
+        // 圆屏：整行内缩，避免行首行尾被圆边裁掉（手机为 0）
+        .padding({ left: this.geom.listPadding, right: this.geom.listPadding })
         .id(LIST_ID)
-        // 内容区起始偏移量：列表滚到顶部时内容与显示区边界保留 24vp
-        .contentStartOffset(CONTENT_START_OFFSET)
+        // 内容区起始偏移量：列表滚到顶部时内容与显示区边界保留一段间距
+        .contentStartOffset(this.geom.contentStartOffset)
         // 内容区末尾偏移量：故意很大，用来验证"有效底部"的自动回滚
-        .contentEndOffset(CONTENT_END_OFFSET)
+        .contentEndOffset(this.geom.contentEndOffset)
         .scrollBar(BarState.Auto)
         .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
         .onAppear(() => {
@@ -442,6 +601,7 @@ struct OffsetListPage {
           this.pendingTarget = -1;
           this.awaitingInitialSettle = true;
           this.startShimmer();
+          hilog.info(DBG_DOMAIN, DBG_TAG, 'onAppear: scrollTo(100000) 拉真正底部');
           try {
             this.scroller.scrollTo({
               xOffset: 0,
@@ -480,11 +640,23 @@ struct OffsetListPage {
         // 只要落点越过"有效底部"就自动收回来。放在这里而不是 onReachEnd，
         // 是为了不打断进行中的甩动动画。
         .onScrollStop(() => {
+          // 刚发起的修正动画还没跑完时，框架会补发一次 onScrollStop（偏移还停在原处），
+          // 这时做落位结算必然误判成"被夹住"，直接丢掉这一次事件。
+          if (this.pendingTarget >= 0
+            && Date.now() - this.correctionStartedAt < CORRECTION_GUARD_MS) {
+            hilog.info(DBG_DOMAIN, DBG_TAG, 'onScrollStop: 修正动画在飞，忽略补发事件');
+            return;
+          }
           // 首屏那次是我们自己发起的，必然停在"真正底部"，强制修正
           const force: boolean = this.reachedRealEnd || this.awaitingInitialSettle;
+          hilog.info(DBG_DOMAIN, DBG_TAG,
+            `onScrollStop: reachedEnd=${this.reachedRealEnd} ` +
+            `awaitingInitial=${this.awaitingInitialSettle}`);
           this.reachedRealEnd = false;
           this.awaitingInitialSettle = false;
           this.pullAccum = 0;
+          // 停下来了，重新量一次锚点：首帧量到的位置不可信（见 ensureAnchor 注释）
+          this.buttonTopPx = -1;
           this.settleAtEffectiveBottom(true, force);
           this.updateDisclaimerVisibility();
         })
@@ -494,16 +666,16 @@ struct OffsetListPage {
         if (this.disclaimerVisible) {
           Row() {
             Text($r('app.string.ai_generated_disclaimer'))
-              .fontSize(12)
+              .fontSize(this.geom.badgeFontSize)
               .fontColor('#6D28D9')
               .textAlign(TextAlign.Center)
-              .height(DISCLAIMER_HEIGHT - DISCLAIMER_BORDER * 2)
-              .padding({ left: 12, right: 12 })
+              .height(this.geom.disclaimerHeight - this.geom.disclaimerBorder * 2)
+              .padding({ left: 8, right: 8 })
               .backgroundColor('#FFFFFF')
-              .borderRadius(DISCLAIMER_RADIUS - DISCLAIMER_BORDER)
+              .borderRadius(this.geom.disclaimerRadius - this.geom.disclaimerBorder)
           }
-          .padding(DISCLAIMER_BORDER)
-          .borderRadius(DISCLAIMER_RADIUS)
+          .padding(this.geom.disclaimerBorder)
+          .borderRadius(this.geom.disclaimerRadius)
           // 边框底色：多色线性渐变
           .linearGradient({
             angle: 90,
@@ -513,7 +685,7 @@ struct OffsetListPage {
           // 叠一层扫动的白色高光 -> 渐变边框流光
           .overlay(this.disclaimerShine())
           .id(DISCLAIMER_ID)
-          .margin({ bottom: DISCLAIMER_MARGIN })
+          .margin({ bottom: this.disclaimerMargin() })
           .transition(
             TransitionEffect.OPACITY
               .animation({ duration: DISCLAIMER_ANIM_DURATION, curve: Curve.EaseOut })
@@ -527,10 +699,10 @@ struct OffsetListPage {
         // 底部固定按钮：悬浮在 List 之上，不随列表滑动
         Button($r('app.string.offset_bottom_button'))
           .id(BUTTON_ID)
-          .width('90%')
-          .height(BUTTON_HEIGHT)
-          .fontSize(16)
-          .margin({ bottom: BUTTON_BOTTOM_MARGIN })
+          .width(this.geom.buttonWidth)
+          .height(this.geom.buttonHeight)
+          .fontSize(this.geom.buttonFontSize)
+          .margin({ bottom: this.geom.buttonBottomMargin })
           .onClick(() => {
             router.back();
           })

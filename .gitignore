@@ -17,6 +17,7 @@ detail_shots/
 nav_*/
 nav_verify/
 nav_ts/
+watch_verify/
 
 # ---- IDE ----
 .idea/
