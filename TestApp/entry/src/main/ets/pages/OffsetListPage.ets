@@ -8,9 +8,11 @@
 //   1. List 底部固定一个按钮，不跟随列表滑动（Stack 悬浮）
 //   2. 初始加载自动滚到"真正底部"，再自动滚回"有效底部"（末条贴着按钮上方）
 //   3. 到顶部后继续往回滚一次，加载 10 条插到列表开头
-//   4. 只要滚到底部（拖动、惯性甩动、表冠滚动，速度快慢都一样），都自动停到"有效底部"：
-//        末条被按钮压住 -> 往前滚，把它顶上来
-//        末条离按钮太远 -> 往回滚，把多余空白收掉
+//   4. **末条只要还在屏上，就不允许它停在安全线以外的位置**——不管什么手势、往哪个方向、
+//      速度快慢（拖动 / 惯性甩动 / 表冠）：停在安全线下方就收上来，被拉到真正底部那侧就放下去。
+//      想让末条离开末尾区域，就用一次幅度够大的滑动把它滑出屏幕（那时不再插手）。
+//      这条是硬约束：以前"用户自己往回划停下就不干预"会导致末条压在提示条上不回弹，
+//      真机反馈"有时候划到顶部没有回弹回来"，现在一律拉回安全线。
 //
 // 兼容穿戴设备：
 //   - 交互上全程不用 onTouch（手表上主要是旋转表冠），
@@ -212,12 +214,16 @@ struct OffsetListPage {
   private pullAccum: number = 0;
   /**
    * 上一次发起的修正"期望落到的偏移"，-1 表示没有待确认的修正。
-   * 下一次滚动停下来时拿实际偏移跟它比对：对上了说明修正生效；对不上说明被滚动范围夹住，
-   * 本次就不再重试（同一手势内不叠加修正，杜绝"修正->滚动->再修正"死循环）。
+   * 下一次滚动停下来时拿实际偏移跟它比对：对上了说明修正生效；对不上说明这次修正
+   * 被后续手势改写了（用户又划了），此时**不能放弃**——按当前实测重新结算一次。
    */
   private pendingTarget: number = -1;
   /** 上一次发起修正动画的时刻（Date.now()），配合 CORRECTION_GUARD_MS 挡掉动画期的补发事件 */
   private correctionStartedAt: number = 0;
+  /** 发起上一次修正时的偏移：用来区分"框架补发的重复事件"和"用户手势真的结束了" */
+  private correctionFromOffset: number = Number.NaN;
+  /** 本次手势中末条底边是否到过安全线（自证"确实滚到底了"，不依赖 onReachEnd/isAtEnd 的时序） */
+  private touchedSafeLine: boolean = false;
   /** 首屏那次滚动是不是我们自己发起的（决定是否强制修正） */
   private awaitingInitialSettle: boolean = false;
 
@@ -301,16 +307,76 @@ struct OffsetListPage {
     }
   }
 
-  /** 实测末条底边的窗口坐标（px），量不到返回 NaN */
+  /**
+   * 实测末条底边的窗口坐标（px），**末条不在列表显示区内时返回 NaN**。
+   *
+   * 注意必须显式判可见性：getRectangleById 对已经滚出显示区的列表项照样返回布局矩形
+   * （实测能给出屏幕下方 1000px 的坐标），只看 size.height 会把"末条早就不在屏上"
+   * 误判成"还在屏上"，于是用户往上翻到一半又被拽回底部。
+   */
   private measureLastItemBottomPx(): number {
     try {
-      const item = this.getUIContext().getComponentUtils().getRectangleById(LAST_ITEM_ID);
+      const ui = this.getUIContext();
+      const item = ui.getComponentUtils().getRectangleById(LAST_ITEM_ID);
       if (item.size.height <= 0) {
         return Number.NaN;
       }
-      return item.windowOffset.y + item.size.height;
+      const list = ui.getComponentUtils().getRectangleById(LIST_ID);
+      if (list.size.height <= 0) {
+        return Number.NaN;
+      }
+      const itemTop: number = item.windowOffset.y;
+      const itemBottom: number = itemTop + item.size.height;
+      const listTop: number = list.windowOffset.y;
+      const listBottom: number = listTop + list.size.height;
+      // 与显示区有交集才算"在屏上"（露出一点也算）
+      if (itemBottom <= listTop || itemTop >= listBottom) {
+        return Number.NaN;
+      }
+      return itemBottom;
     } catch (err) {
       return Number.NaN;
+    }
+  }
+
+  /** 安全线的窗口坐标（px），量不到锚点返回 NaN */
+  private safeLineBottomPx(): number {
+    if (!this.ensureAnchor()) {
+      return Number.NaN;
+    }
+    return this.buttonTopPx - this.getUIContext().vp2px(this.safeLineInsetFromButtonTop());
+  }
+
+  /** 当前滚动偏移，取不到返回 NaN */
+  private currentOffsetOrNaN(): number {
+    try {
+      return this.scroller.currentOffset().yOffset;
+    } catch (err) {
+      return Number.NaN;
+    }
+  }
+
+  /**
+   * 每帧检查：末条底边是不是已经到过/越过安全线。
+   * 到过就锁存到本次滚动结算——这是"确实滚到底了"的自证，
+   * 不再依赖 onReachEnd / isAtEnd()（实测它们会漏报，导致漏掉回弹）。
+   * 末条量不到（已经滚出显示区）说明用户离开了末尾区域，锁存跟着清掉。
+   */
+  private markSafeLineTouched(): void {
+    const itemBottomPx: number = this.measureLastItemBottomPx();
+    if (Number.isNaN(itemBottomPx)) {
+      this.touchedSafeLine = false;
+      return;
+    }
+    if (this.touchedSafeLine) {
+      return;
+    }
+    const safePx: number = this.safeLineBottomPx();
+    if (Number.isNaN(safePx)) {
+      return;
+    }
+    if (itemBottomPx <= safePx + this.getUIContext().vp2px(OVERFLOW_TOLERANCE)) {
+      this.touchedSafeLine = true;
     }
   }
 
@@ -320,13 +386,13 @@ struct OffsetListPage {
    * 返回 NaN 表示量不到（未布局 / 已滚出显示区）。
    */
   private measureOverflow(): number {
-    if (!this.ensureAnchor()) {
+    const safeBottomPx: number = this.safeLineBottomPx();
+    if (Number.isNaN(safeBottomPx)) {
       hilog.info(DBG_DOMAIN, DBG_TAG, 'measure: 量不到按钮锚点');
       return Number.NaN;
     }
     const itemBottomPx: number = this.measureLastItemBottomPx();
     const ui = this.getUIContext();
-    const safeBottomPx: number = this.buttonTopPx - ui.vp2px(this.safeLineInsetFromButtonTop());
     if (Number.isNaN(itemBottomPx)) {
       hilog.info(DBG_DOMAIN, DBG_TAG,
         `measure: 末条量不到 buttonTop=${this.buttonTopPx} safe=${safeBottomPx.toFixed(1)}`);
@@ -439,42 +505,43 @@ struct OffsetListPage {
       `settle: force=${force} cur=${current.toFixed(1)} pending=${this.pendingTarget.toFixed(1)} ` +
       `items=${this.items.length}`);
 
-    // 先给上一次修正结账：落位了才允许发起新的修正。
-    // 关键点：这个判断只看"本次实际偏移有没有到达上次的目标"，
-    // 不做跨手势的位置比对——否则用户再次滚到同一个底部位置时会被误判成"没进展"而不再回弹。
+    // 先给上一次修正结账。关键：**落不落位都继续往下算**。
+    // 落位了说明修正生效；没落位只可能是"上一次修正被后面的手势改写了"（用户又划了），
+    // 这时必须按当前实测重新结算一次——以前这里直接 return 放弃，
+    // 结果就是列表永远停在"真正底部"、状态误报"已到滚动极限"（真机复现过）。
     if (this.pendingTarget >= 0) {
-      const landed: boolean = Math.abs(current - this.pendingTarget) <= OVERFLOW_TOLERANCE;
+      const expected: number = this.pendingTarget;
+      const landed: boolean = Math.abs(current - expected) <= OVERFLOW_TOLERANCE;
       this.pendingTarget = -1;
-      if (!landed) {
-        // 上一次修正没有落位 -> 被滚动范围夹住，本次不再重试
-        hilog.info(DBG_DOMAIN, DBG_TAG, `settle: 未落位 cur=${current.toFixed(1)}，放弃本次修正`);
-        this.statusText = '已到滚动极限，无法再往上收回';
-        return;
+      if (landed) {
+        hilog.info(DBG_DOMAIN, DBG_TAG, 'settle: 上次修正已落位，继续');
+      } else {
+        hilog.info(DBG_DOMAIN, DBG_TAG,
+          `settle: 上次修正被后续手势改写（cur=${current.toFixed(1)} 期望=${expected.toFixed(1)}），按实测重算`);
       }
-      hilog.info(DBG_DOMAIN, DBG_TAG, 'settle: 上次修正已落位，继续');
     }
 
     const overflow: number = this.measureOverflow();
     let delta: number = 0;
     if (Number.isNaN(overflow)) {
-      // 末条量不到（contentEndOffset 太大，已经把它推出显示区）时，
-      // 只有确认到达框架底部，才按配置值推算需要收回的距离
+      // 末条已经滚出显示区（用户在列表中部，或 contentEndOffset 把它推出去了）。
+      // 只有确认到达框架底部（或首屏那次），才按配置值推算需要收回的距离；
+      // 否则用户在列表中部停下来时不该被插手。
       if (!force) {
-        hilog.info(DBG_DOMAIN, DBG_TAG, 'settle: 量不到末条且非强制，不干预');
+        hilog.info(DBG_DOMAIN, DBG_TAG, 'settle: 末条不在屏上且非强制，不干预');
         return;
       }
       delta = -(this.geom.contentEndOffset - this.fallbackInset());
     } else {
-      if (!force && overflow > OVERFLOW_TOLERANCE) {
-        // 末条还在按钮下方且是用户自己停在这里的，说明没滚到"有效底部"，不干预
-        hilog.info(DBG_DOMAIN, DBG_TAG, `settle: 末条在安全线下方 ${overflow.toFixed(1)}vp，不干预`);
-        return;
-      }
       if (Math.abs(overflow) <= OVERFLOW_TOLERANCE) {
-        // 末条已经在按钮上方刚好位置
+        // 末条刚好停在安全线上
         hilog.info(DBG_DOMAIN, DBG_TAG, `settle: 已在有效底部（overflow=${overflow.toFixed(2)}）`);
         return;
       }
+      // 末条只要还在屏上，就不允许它停在安全线以外的地方：
+      //   为正（压在提示条/按钮那边）-> 往回收上来
+      //   为负（被拉到真正底部那侧）-> 放下去
+      // 不看手势方向、不看 onReachEnd——"不管怎么划，末条都得回到安全线"。
       delta = overflow;
     }
 
@@ -489,6 +556,7 @@ struct OffsetListPage {
     }
     this.pendingTarget = target;
     this.correctionStartedAt = Date.now();
+    this.correctionFromOffset = current;
     this.statusText = `自动滚回底部 · 修正 ${delta.toFixed(0)}vp`;
     hilog.info(DBG_DOMAIN, DBG_TAG,
       `settle: 发起修正 delta=${delta.toFixed(1)} target=${target.toFixed(1)} animate=${animate}`);
@@ -621,7 +689,12 @@ struct OffsetListPage {
         .onDidScroll((scrollOffset: number, _scrollState: ScrollState) => {
           if (this.scroller.isAtEnd()) {
             this.reachedRealEnd = true;
+          } else {
+            // 离开末尾就清掉，避免陈旧标记把中段的用户一把拽到末尾
+            this.reachedRealEnd = false;
           }
+          // 每帧自证"是否已经到过底部"，不依赖 onReachEnd / isAtEnd() 的时序
+          this.markSafeLineTouched();
           // 每帧按末条位置刷新提示条显隐（表冠 / 触摸 / 惯性都会走到这里）
           this.updateDisclaimerVisibility();
           if (scrollOffset < 0 && this.isAtTop()) {
@@ -640,20 +713,29 @@ struct OffsetListPage {
         // 只要落点越过"有效底部"就自动收回来。放在这里而不是 onReachEnd，
         // 是为了不打断进行中的甩动动画。
         .onScrollStop(() => {
-          // 刚发起的修正动画还没跑完时，框架会补发一次 onScrollStop（偏移还停在原处），
-          // 这时做落位结算必然误判成"被夹住"，直接丢掉这一次事件。
+          // 刚发起的修正动画还没跑完时，框架会补发一次 onScrollStop。
+          // 判据必须是"**偏移一点没动**"（补发事件的特征），不能只看时间：
+          // 只看时间会把用户手势真正结束的那次事件也吞掉，那次手势就完全没结算——
+          // 真机表现就是"有时候划到底没有回弹"。
           if (this.pendingTarget >= 0
-            && Date.now() - this.correctionStartedAt < CORRECTION_GUARD_MS) {
-            hilog.info(DBG_DOMAIN, DBG_TAG, 'onScrollStop: 修正动画在飞，忽略补发事件');
+            && Date.now() - this.correctionStartedAt < CORRECTION_GUARD_MS
+            && Math.abs(this.currentOffsetOrNaN() - this.correctionFromOffset) <= OVERFLOW_TOLERANCE) {
+            hilog.info(DBG_DOMAIN, DBG_TAG, 'onScrollStop: 修正动画在飞（偏移未变），忽略补发事件');
             return;
           }
-          // 首屏那次是我们自己发起的，必然停在"真正底部"，强制修正
-          const force: boolean = this.reachedRealEnd || this.awaitingInitialSettle;
+          // 要不要按配置值兜底修正（末条已经在屏外时）？
+          //   1) 首屏那次是我们自己拉到"真正底部"的；
+          //   2) 框架报了到达末尾；
+          //   3) 本次手势里末条到过安全线（自证滚到底了，不依赖 onReachEnd/isAtEnd 的时序）。
+          // 注意：末条**在屏上**时根本不看 force——见 settleAtEffectiveBottom。
+          const force: boolean = this.reachedRealEnd || this.awaitingInitialSettle
+            || this.touchedSafeLine;
           hilog.info(DBG_DOMAIN, DBG_TAG,
-            `onScrollStop: reachedEnd=${this.reachedRealEnd} ` +
-            `awaitingInitial=${this.awaitingInitialSettle}`);
+            `onScrollStop: reachedEnd=${this.reachedRealEnd} awaitingInitial=${this.awaitingInitialSettle} ` +
+            `touchedSafeLine=${this.touchedSafeLine} -> force=${force}`);
           this.reachedRealEnd = false;
           this.awaitingInitialSettle = false;
+          this.touchedSafeLine = false;
           this.pullAccum = 0;
           // 停下来了，重新量一次锚点：首帧量到的位置不可信（见 ensureAnchor 注释）
           this.buttonTopPx = -1;

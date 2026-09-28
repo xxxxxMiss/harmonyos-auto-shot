@@ -24,6 +24,7 @@ import argparse
 import os
 import re
 import sys
+import threading
 import time
 from typing import List, Optional
 
@@ -135,27 +136,82 @@ class Verifier:
         return path
 
     # ---- 输入（坐标一律落在"纯列表带"内，别打到悬浮按钮/提示条上）----
-    def swipe_up(self, velocity: int = 2000) -> None:
+    def raw_swipe_up(self, velocity: int = 2000) -> None:
+        """不等待的上划：用来模拟"不等回弹动画结束就继续划"的连续快速手势。"""
         self.drv._shell("uitest", "uiInput", "swipe", "233", str(Y_BOTTOM), "233", str(Y_TOP),
                         str(velocity))
+
+    def raw_swipe_down(self, velocity: int = 2500, y_from: int = Y_TOP,
+                       y_to: int = Y_BOTTOM) -> None:
+        self.drv._shell("uitest", "uiInput", "swipe", "233", str(y_from), "233", str(y_to),
+                        str(velocity))
+
+    def swipe_up(self, velocity: int = 2000) -> None:
+        self.raw_swipe_up(velocity)
         time.sleep(0.9)
 
-    def swipe_down(self, velocity: int = 2500) -> None:
-        self.drv._shell("uitest", "uiInput", "swipe", "233", str(Y_TOP), "233", str(Y_BOTTOM),
-                        str(velocity))
+    def swipe_down(self, velocity: int = 2500, y_from: int = Y_TOP, y_to: int = Y_BOTTOM) -> None:
+        self.raw_swipe_down(velocity, y_from, y_to)
         time.sleep(0.9)
+
+    def raw_fling_up(self, velocity: int = 8000) -> None:
+        self.drv._shell("uitest", "uiInput", "fling", "233", str(Y_BOTTOM), "233", str(Y_TOP),
+                        str(velocity))
 
     def fling_up(self, velocity: int = 8000) -> None:
         """惯性甩到底：命中 onReachEnd / isAtEnd，触发"真正底部 -> 有效底部"回弹。"""
-        self.drv._shell("uitest", "uiInput", "fling", "233", str(Y_BOTTOM), "233", str(Y_TOP),
-                        str(velocity))
+        self.raw_fling_up(velocity)
+        time.sleep(2.2)
+
+    def fling_down(self, velocity: int = 6000) -> None:
+        """大幅往回甩：幅度足以把末条滑出屏幕、正常离开末尾区域。"""
+        self.drv._shell("uitest", "uiInput", "fling", "233", str(Y_TOP + 20), "233",
+                        str(Y_BOTTOM), str(velocity))
         time.sleep(2.2)
 
     def scroll_content_down_px(self, px: int) -> None:
-        """把内容往下挪 px（等价于往上回滚一点），低速短划，便于落进提示条让位窗口。"""
+        """把内容往下挪 px（等价于往上回滚一点），低速短划。"""
         self.drv._shell("uitest", "uiInput", "swipe", "233", str(Y_TOP), "233", str(Y_TOP + px),
                         "300")
         time.sleep(1.0)
+
+    def observe_yield_during_drag(self) -> tuple:
+        """观察"末条经过提示条时提示条让位"。
+
+        现在松手一定会回弹到安全线，所以让位只能在**拖动过程中**看到：
+        后台线程发一次慢速 drag，主线程轮询控件树，看提示条节点是不是消失了。
+        （提示条隐藏后控件树里就没有这个节点，所以"节点消失"就是让位的判据。）
+        """
+        err: List[str] = []
+
+        def run() -> None:
+            try:
+                self.drv._shell("uitest", "uiInput", "drag", "233", str(Y_TOP), "233",
+                                str(Y_TOP + 180), "200")
+            except Exception as e:                 # noqa: BLE001 - 线程里只能自己兜住
+                err.append(str(e))
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        hidden = False
+        samples = 0
+        shot_path = ""
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            try:
+                root = self.tree()
+            except Exception:                      # noqa: BLE001 - 拖动中 dump 偶发失败，重试即可
+                continue
+            samples += 1
+            if self.by_text(root, TXT_DISCLAIMER) is None:
+                hidden = True
+                shot_path = self.shot("04_disclaimer_yielded")   # 让位瞬间留证
+                break
+        t.join(timeout=5.0)
+        if hidden:
+            return True, f"拖动中采样 {samples} 次，提示条节点消失（让位生效）", shot_path
+        extra = f"；错误：{'；'.join(err)}" if err else ""
+        return False, f"拖动中采样 {samples} 次，提示条始终在屏上{extra}", ""
 
     # ---- 量测 ----
     def measure(self) -> dict:
@@ -184,6 +240,25 @@ class Verifier:
             "delta_vs_safe_line_px": delta_px,
             "delta_vs_safe_line_vp": round(delta_px / PX_PER_VP, 1),
         }
+
+    def last_item_in_view(self) -> tuple:
+        """末条是否还在列表显示区内。
+
+        注意不能只判断"控件树里有没有末条"：List 对屏幕外一小段距离的列表项仍有渲染缓存，
+        滚出屏幕后它可能还挂在树上。判据用末条矩形与列表矩形的**交集**（与页内
+        measureLastItemBottomPx 的口径一致）。
+        """
+        root = self.tree()
+        item = self.by_id(root, ID_LAST_ITEM)
+        lst = self.by_id(root, ID_LIST)
+        if item is None or item.bounds is None:
+            return False, "末条已不在控件树上（滑出屏幕）"
+        ib = item.bounds
+        if lst is None or lst.bounds is None:
+            return ib[1] < R_PX * 2, f"末条 {ib}（列表矩形量不到）"
+        lb = lst.bounds
+        visible = ib[3] > lb[1] and ib[1] < lb[3]
+        return visible, f"末条 {ib} / 列表 {lb} -> {'仍在显示区内' if visible else '已滑出显示区'}"
 
     # ---- 步骤 ----
     def step(self, name: str, ok: bool, detail: str, shot: Optional[str] = None) -> None:
@@ -283,6 +358,12 @@ def main() -> int:
     ap.add_argument("--out-dir", default=os.path.join(REPO_ROOT, "watch_verify"))
     args = ap.parse_args()
 
+    # 清掉上一次的产物，避免旧截图混进本次像素复核
+    if os.path.isdir(args.out_dir):
+        for name in os.listdir(args.out_dir):
+            if name.endswith(".png") or name.endswith(".md") or name.endswith(".json"):
+                os.remove(os.path.join(args.out_dir, name))
+
     v = Verifier(args.out_dir)
     print(f"设备: {v.size} px, bundle={v.bundle}, 输出目录={v.out_dir}")
 
@@ -303,6 +384,23 @@ def main() -> int:
         "本次只连了手表（hdc 上只有 NIZ-AL00），手机几何参数 PHONE_GEOMETRY 未改动、**未重新真机验证**；"
         "但安全线口径修正（safeLineInsetFromButtonTop 不再误用 disclaimerMargin）同时作用于手机，"
         "接入手机后建议重跑一次本脚本（把几何常量换成手机那套）。")
+    v.notes.append(
+        "**回弹硬约束（本次用户诉求「不管怎样一定要回弹回来」）**：末条只要还在列表显示区内，就不允许停在"
+        "安全线以外——不看手势方向、不看速度快慢，也不依赖 onReachEnd / isAtEnd()（真机实测它们在"
+        "快速连划时会漏报）。要离开末尾区域，得用一次幅度足够大的滑动/甩动把末条滑出显示区"
+        "（需要约 134vp 位移），此后不再插手；本脚本第 10、11 项分别锁这两种行为。")
+    v.notes.append(
+        "定位到的三个「划到底不回弹」根因（都已在页内修掉）："
+        "① 上一次修正的 pendingTarget 被后续快速手势改写后，原实现直接「放弃本次修正」并 return，"
+        "列表就永久停在框架「真正底部」（末条 146px、状态误报「已到滚动极限」）——现在改成按当前实测重算；"
+        "② 是否「强制回弹」原先只看 onReachEnd / isAtEnd()，快速连划时它们会漏报，于是走进"
+        "「末条在安全线下方就不干预」分支——现在末条在屏上时根本不看这两个信号；"
+        "③ getRectangleById 对已经滚出显示区的列表项照样返回布局矩形（实测能给到屏幕下方 1000px 的坐标），"
+        "只看 size.height 会把「早就不在屏上」误判成「还在屏上」，导致用户往列表中部翻也被拽回底部——"
+        "现在显式用「末条矩形与列表矩形有交集」判可见性。")
+    v.notes.append(
+        "提示条让位现在只能在**拖动过程中**观察到：松手一定会被拉回安全线，末条无法静止在提示条上。"
+        "所以本脚本第 6 项改成「后台线程发慢速 drag + 主线程并发轮询控件树」，以「提示条节点消失」为让位判据。")
 
     # 1. 首屏：onAppear 里 scrollTo(100000) 拉到"真正底部"，再自动收回"有效底部"
     first = v.check_settled("首屏自动回正到有效底部", "01_initial_settle", TXT_TOP_SETTLE)
@@ -311,16 +409,27 @@ def main() -> int:
            f"末条文案「{TXT_LAST_MOCK}」{'在' if v.has_text(root, TXT_LAST_MOCK) else '不在'}控件树上"
            f" | 提示条{'显示' if first.get('disclaimer_visible') else '隐藏'}")
 
-    # 2. 先把末条往下推离安全线（模拟"用户滚到了底部以下"），再甩到底看是否自动回弹
-    v.scroll_content_down_px(160)
-    try:
-        pushed = v.measure()
-        pushed_down = pushed["delta_vs_safe_line_px"] > TOLERANCE_PX
-        detail = (f"末条底边 {pushed['last_item_bottom']}px，安全线 {pushed['safe_line_px']}px，"
-                  f"低了 {pushed['delta_vs_safe_line_vp']}vp")
-    except RuntimeError as e:
-        pushed_down, detail = False, f"量不到末条：{e}"
-    v.step("预备动作：把末条推离安全线", pushed_down, detail, v.shot("02_pushed_off_safe_line"))
+    # 2. 硬约束：末条只要还在屏上，就不许停在安全线以外。
+    #    往回划一点（离开有效底部）后松手 -> 必须被拉回安全线。
+    pullbacks = 0
+    pull_ok = True
+    pull_detail = ""
+    for i in range(3):
+        v.swipe_down(velocity=250, y_from=Y_TOP + 80, y_to=Y_TOP + 160)   # 小幅往回划
+        try:
+            m = v.measure()
+        except RuntimeError as e:
+            pull_ok, pull_detail = False, f"第 {i + 1} 次往回划后量不到末条：{e}"
+            break
+        pullbacks += 1
+        d = m["delta_vs_safe_line_vp"]
+        if abs(m["delta_vs_safe_line_px"]) > TOLERANCE_PX:
+            pull_ok = False
+            pull_detail = f"第 {i + 1} 次往回划后停在安全线外（末条底边 {m['last_item_bottom']}px，偏差 {d}vp）"
+            break
+        pull_detail = f"{pullbacks} 次小幅往回划后都被拉回：末条底边 {m['last_item_bottom']}px，偏差 {d}vp"
+    v.step("往回划离开有效底部后自动拉回（强制回弹）", pull_ok,
+           pull_detail, v.shot("02_pull_back_snapped"))
 
     # 3. 甩到框架"真正底部" -> 应自动回弹到安全线，且状态显示做过修正
     second = v.fling_to_effective_bottom("甩到真正底部后自动回弹", "03_after_fling_to_end",
@@ -329,38 +438,67 @@ def main() -> int:
            bool(second) and abs(second["last_item_bottom"] - first["last_item_bottom"]) <= TOLERANCE_PX,
            f"首屏 {first['last_item_bottom']}px vs 回弹后 {second.get('last_item_bottom')}px")
 
-    # 4. 提示条让位：把末条挪进"让位判定窗口"（提示条底边附近），提示条应淡出。
-    #    窗口 = d ∈ (-(提示条高+clear), approach] = (-24vp, 10vp]（穿戴参数）。
-    #    提示条一旦隐藏，控件树里就没有这个节点，所以 d 一律以"静止时的提示条底边"为基准。
-    ref_disc_bottom = first["disclaimer_bounds"][3] if first.get("disclaimer_bounds") else None
-    yield_state: Optional[dict] = None
-    for _ in range(8):
-        try:
-            m = v.measure()
-        except RuntimeError:
-            break
-        if ref_disc_bottom is None:
-            break
-        d_vp = (m["last_item_bottom"] - ref_disc_bottom) / PX_PER_VP
-        m["item_vs_disclaimer_vp"] = round(d_vp, 1)
-        if -24 < d_vp <= 10:
-            yield_state = m
-            break
-        v.scroll_content_down_px(50)
-    v.step("末条经过提示条时提示条让位淡出",
-           yield_state is not None and not yield_state["disclaimer_visible"],
-           (f"末条底边相对提示条底边 {yield_state['item_vs_disclaimer_vp']}vp，"
-            f"提示条{'已隐藏' if yield_state and not yield_state['disclaimer_visible'] else '仍在'}"
-            if yield_state else "8 次微调都没把末条挪进让位窗口"),
-           v.shot("04_disclaimer_yielded"))
+    # 4. 提示条让位：末条挪进"让位判定窗口"（提示条底边附近）时提示条应淡出。
+    #    窗口 = d ∈ (-(提示条高+clear), approach]，穿戴参数约 (-24vp, 10vp]。
+    #    现在松手就会回弹到安全线，所以让位只能在**拖动过程中**观察到：
+    #    用后台线程发一个慢速 drag，同时轮询控件树，看提示条节点是否消失。
+    v.step("末条经过提示条时提示条让位淡出（拖动中采样）", *v.observe_yield_during_drag())
 
-    # 5. 再甩到底 -> 末条回到提示条上方 -> 提示条恢复显示
+    # 5. 松手回弹后 -> 末条回到提示条上方 -> 提示条恢复显示
     third = v.fling_to_effective_bottom("提示条恢复 + 再次回弹", "05_disclaimer_restored",
                                         TXT_TOP_SETTLE)
     v.step("回到有效底部后提示条重新出现", bool(third.get("disclaimer_visible")),
            f"提示条{'显示' if third.get('disclaimer_visible') else '隐藏'}")
 
-    # 6. 顶部下拉加载：先划回顶部，再在顶部继续往回滚 -> 插 10 条到列表开头。
+    # 6. 压力：连续快速上划（不等回弹动画结束就再划）+ 回弹动画中途反向打断，
+    #    最后都必须停在安全线——这是"不管怎样都要回弹回来"的回归用例。
+    stress_fails: List[str] = []
+    stress_rounds = 0
+    for i in range(3):
+        for _ in range(3):
+            v.raw_swipe_up(velocity=2500)          # 故意不等回弹动画结束
+        time.sleep(2.5)
+        stress_rounds += 1
+        try:
+            m = v.measure()
+        except RuntimeError as e:
+            stress_fails.append(f"快速连划 #{i + 1}：{e}")
+            continue
+        if abs(m["delta_vs_safe_line_px"]) > TOLERANCE_PX:
+            stress_fails.append(f"快速连划 #{i + 1}：停在 {m['last_item_bottom']}px"
+                                f"（偏差 {m['delta_vs_safe_line_vp']}vp）")
+    for i in range(3):
+        v.raw_fling_up()
+        time.sleep(0.15)                            # 抢在 420ms 回弹动画中途
+        v.raw_swipe_down(velocity=250)
+        time.sleep(2.5)
+        stress_rounds += 1
+        try:
+            m = v.measure()
+        except RuntimeError as e:
+            stress_fails.append(f"打断回弹 #{i + 1}：{e}")
+            continue
+        if abs(m["delta_vs_safe_line_px"]) > TOLERANCE_PX:
+            stress_fails.append(f"打断回弹 #{i + 1}：停在 {m['last_item_bottom']}px"
+                                f"（偏差 {m['delta_vs_safe_line_vp']}vp）")
+    v.step("压力：快速连划 / 打断回弹后仍回到安全线", not stress_fails,
+           f"{stress_rounds} 轮全部落回安全线" if not stress_fails
+           else "；".join(stress_fails), v.shot("06_stress_always_bounces"))
+
+    # 7. 不粘死：一次幅度够大的往回甩应该能把末条滑出屏幕、正常离开末尾区域
+    escaped = False
+    escape_detail = ""
+    for i in range(3):
+        v.fling_down(velocity=6000)
+        in_view, why = v.last_item_in_view()
+        escape_detail = f"第 {i + 1} 次大幅回甩后：{why}"
+        if not in_view:
+            escaped = True
+            break
+    v.step("大幅回甩可以离开末尾区域（不被粘在底部）", escaped,
+           escape_detail, v.shot("07_escaped_end_region"))
+
+    # 8. 顶部下拉加载：先划回顶部，再在顶部继续往回滚 -> 插 10 条到列表开头。
     #    判据用"列表里出现「下拉加载第…」批次条目"：加载只能发生在顶部继续往回滚时，
     #    所以这同时证明了"划到了顶部"。
     loaded = False
@@ -374,15 +512,15 @@ def main() -> int:
     v.step("划回顶部后继续往回滚触发下拉加载", loaded,
            f"{swipes} 次下划后列表里{'出现' if loaded else '没出现'}"
            f"「{TXT_LOADED_PREFIX}…」批次条目 | 状态「{v.status_text(root)}」",
-           v.shot("06_pull_down_load_more"))
+           v.shot("08_pull_down_load_more"))
 
-    # 7. 加载之后再甩到底，仍然停到有效底部（下拉是插到列表开头，偏移会跳变，回弹逻辑必须还能收敛）
-    fourth = v.fling_to_effective_bottom("加载更多后仍能回弹到有效底部", "07_settle_after_load_more")
+    # 9. 加载之后再滚到底，仍然停到有效底部（下拉是插到列表开头，偏移会跳变，回弹逻辑必须还能收敛）
+    fourth = v.fling_to_effective_bottom("加载更多后仍能回弹到有效底部", "09_settle_after_load_more")
     v.step("末条底边仍在安全线上",
            bool(fourth) and abs(fourth["delta_vs_safe_line_px"]) <= TOLERANCE_PX,
            f"偏差 {fourth.get('delta_vs_safe_line_vp')}vp")
 
-    # 8. 圆屏适配：功能性控件的四角都要落在 466x466 圆内（否则会被圆边裁掉）
+    # 10. 圆屏适配：功能性控件的四角都要落在 466x466 圆内（否则会被圆边裁掉）
     root = v.tree()
     last_item = v.by_id(root, ID_LAST_ITEM)
     button = v.by_id(root, ID_BUTTON)
@@ -402,7 +540,7 @@ def main() -> int:
             outside.append(label)
     v.step("末条/提示条/底部按钮都落在圆屏内接区域内", not outside,
            "；".join(notes) + (f" —— 越界：{outside}" if outside else ""),
-           v.shot("08_circle_containment"))
+           v.shot("10_circle_containment"))
 
     # 顶部状态条是排障用的横条，无法完全躲开圆顶弧（圆在 y=0 处宽度为 0），
     # 系统会把窗口裁成圆形，所以两端被裁掉一部分；这里把它作为已知取舍量出来记录。

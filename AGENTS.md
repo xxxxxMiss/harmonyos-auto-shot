@@ -77,8 +77,10 @@ cd TestApp && export DEVECO_SDK_HOME="/Applications/DevEco-Studio.app/Contents/s
 - **设备 USB 连接反复掉线**：真机验证前先 `hdc list targets` 确认设备在线。
 - **隐私页禁止截屏（SECURE）**会得到黑图，驱动会显式报错。
 - **`contentStartOffset` + `contentEndOffset` 之和不能超过 List 显示区高度**：超过时框架把两者**静默置 0**（文档："超过 List 内容区长度后置 0"，实测比对的是显示区高度）。手表圆屏列表区只有 211vp，`OffsetListPage` 原先取 `12+200=212` 直接失效——`contentEndOffset` 完全不产生可滚动空间、末条永远贴着列表底边收不回来；改成 `12+160=172` 才正常。手机参数 `24+520=544` 远小于手机列表高度，不受影响。
-- **在 `onScrollStop` 里调 `scroller.scrollTo` 会被框架补发一次 `onScrollStop`**（实测 ~1ms 后），此时偏移还停在原处，任何"目标没达到就放弃"的判定都会误判成"被滚动范围夹住"。`OffsetListPage` 用 `CORRECTION_GUARD_MS`(150ms) 时间窗挡掉动画期内的补发事件。
+- **在 `onScrollStop` 里调 `scroller.scrollTo` 会被框架补发一次 `onScrollStop`**（实测 ~1ms 后），此时偏移还停在原处。挡这个补发事件**不能只看时间窗**：`CORRECTION_GUARD_MS`(150ms) 之内也可能是用户手势真正结束的那次事件，被吞掉就意味着"这次划到底完全没结算"（真机表现：有时候划到底不回弹）。`OffsetListPage` 现在的判据是"时间窗内 **且** 偏移相对发起修正时一点没动（`correctionFromOffset`）"，两个条件同时满足才丢弃。
 - **`getRectangleById()` 的坐标首帧不可信**：布局稳定前量到的按钮位置实测偏高 22vp，缓存下来会永久偏高。要作为几何锚点就得在每次滚动停止后重新量。
+- **`getRectangleById()` 对已经滚出显示区的列表项照样返回布局矩形**：实测能给出屏幕下方 1000px 之外的坐标，只看 `size.height > 0` 会把"早就不在屏上"误判成"还在屏上"。需要"是否可见"时必须显式算 `item 矩形 ∩ list 矩形`（`OffsetListPage.measureLastItemBottomPx` 就是这么做的），否则"末条在屏上就拉回安全线"的规则会把翻到列表中部的用户也拽回底部。
+- **回弹是硬约束，不要"放弃修正"**：`OffsetListPage` 的契约是"末条只要还在列表显示区内，就必须停在安全线（按钮顶边上方 34vp）"。原先"上一次修正的目标没落位就放弃本次"的分支会造成永久停在框架真正底部（末条贴屏底、状态误报"已到滚动极限"）——快速连划时 pendingTarget 会被后一次手势改写，所以**每次停下都要按当前实测重新结算**；同时"是否强制回弹"不能只信 `onReachEnd`/`isAtEnd()`（快速连划会漏报），要由每帧实测的末条位置自证。想离开末尾区域只能用一次大幅度滑动把末条滑出显示区。
 - **圆屏手势坐标要避开悬浮层**：466x466 圆屏上状态条(0~44px)、提示条(294~334px)、底部按钮(346~406px) 都会截走触摸，`uitest uiInput` 划动要落在中间"纯列表带"(约 y 70~280) 才划得动列表。
 
 ## 关键技术决策
