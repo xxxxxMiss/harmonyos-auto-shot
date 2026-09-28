@@ -50,6 +50,7 @@
     { "name": "color_border_palette", "value": "Next palette" },
     { "name": "nav_offset_list", "value": "Open Offset List" },
     { "name": "offset_bottom_button", "value": "Fixed Bottom Button (does not scroll)" },
+    { "name": "offset_append_button", "value": "Append 5 at bottom" },
     { "name": "unused_string", "value": "Nobody references me" }
   ]
 }

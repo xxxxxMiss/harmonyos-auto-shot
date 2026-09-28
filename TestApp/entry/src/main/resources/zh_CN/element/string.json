@@ -50,6 +50,7 @@
     { "name": "color_border_palette", "value": "换一组颜色" },
     { "name": "nav_offset_list", "value": "偏移列表（触底回弹）" },
     { "name": "offset_bottom_button", "value": "底部固定按钮（不随列表滚动）" },
+    { "name": "offset_append_button", "value": "底部插入5条" },
     { "name": "unused_string", "value": "没有任何页面引用我" }
   ]
 }

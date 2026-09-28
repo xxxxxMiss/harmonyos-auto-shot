@@ -63,12 +63,15 @@ CIRCLE_TOL_PX = 2
 ID_LAST_ITEM = "offset_last_item"
 ID_BUTTON = "offset_bottom_button"
 ID_LIST = "offset_list"
+ID_APPEND = "offset_append_button"
 
 TXT_DISCLAIMER = "内容由AI生成"
 TXT_ENTRY = "偏移列表（触底回弹）"
 TXT_LOADED_PREFIX = "下拉加载第"
 TXT_LAST_MOCK = "初始 Mock 数据 #30"
 TXT_TOP_SETTLE = "自动滚回底部"
+TXT_APPEND_STATUS = "已从底部插入"
+APPEND_CLICKS = 6          # 连点右侧按钮的次数（每次 +5 条）
 
 
 class Verifier:
@@ -121,7 +124,7 @@ class Verifier:
     @staticmethod
     def status_text(root: L.Node) -> str:
         """顶部状态条：本页的调试文案（不含列表项与提示条）。"""
-        marks = ("contentEndOffset", "自动滚回", "已加载", "滚动极限")
+        marks = ("contentEndOffset", "自动滚回", "已加载", "滚动极限", TXT_APPEND_STATUS)
         best = ""
         for n in L.iter_nodes(root):
             t = L.normalize_text(n.text)
@@ -168,6 +171,18 @@ class Verifier:
         self.drv._shell("uitest", "uiInput", "fling", "233", str(Y_TOP + 20), "233",
                         str(Y_BOTTOM), str(velocity))
         time.sleep(2.2)
+
+    def click_append(self) -> tuple:
+        """点底部右侧按钮（从列表底部追加 5 条）。返回按钮中心坐标。"""
+        node = self.by_id(self.tree(), ID_APPEND)
+        if node is None or node.bounds is None:
+            raise RuntimeError("量不到底部右侧按钮 offset_append_button")
+        cx, cy = node.center()
+        if (cx - CX_PX) ** 2 + (cy - R_PX) ** 2 > (R_PX - 12) ** 2:
+            raise RuntimeError(f"右侧按钮中心 ({cx},{cy}) 落在圆外，点不到")
+        self.drv.click(cx, cy)
+        time.sleep(1.2)
+        return cx, cy
 
     def scroll_content_down_px(self, px: int) -> None:
         """把内容往下挪 px（等价于往上回滚一点），低速短划。"""
@@ -399,6 +414,12 @@ def main() -> int:
         "只看 size.height 会把「早就不在屏上」误判成「还在屏上」，导致用户往列表中部翻也被拽回底部——"
         "现在显式用「末条矩形与列表矩形有交集」判可见性。")
     v.notes.append(
+        "**底部右侧按钮（从列表底部追加 5 条）与提示条**：追加时滚动偏移没变、末尾又长出内容，"
+        "所以这一刻列表已经不在有效底部——`OffsetListPage.appendAtBottom` 不等测量直接让位隐藏并上闩，"
+        "避免「插入瞬间 ForEach 还没重渲染、量到的仍是插入前的旧末条（还挂在安全线上）」把提示条弹回来"
+        "（真机实测过这个竞态：固定延时 120ms 重判，3 轮里会漏 1 次）。"
+        "用户滚到新的底部、末条重新升到提示条上方时，位置判定会自动解锁恢复显示。")
+    v.notes.append(
         "提示条让位现在只能在**拖动过程中**观察到：松手一定会被拉回安全线，末条无法静止在提示条上。"
         "所以本脚本第 6 项改成「后台线程发慢速 drag + 主线程并发轮询控件树」，以「提示条节点消失」为让位判据。")
 
@@ -520,12 +541,63 @@ def main() -> int:
            bool(fourth) and abs(fourth["delta_vs_safe_line_px"]) <= TOLERANCE_PX,
            f"偏差 {fourth.get('delta_vs_safe_line_vp')}vp")
 
-    # 10. 圆屏适配：功能性控件的四角都要落在 466x466 圆内（否则会被圆边裁掉）
+    # 10. 底部按钮改成一行并排两个（左：原功能返回；右：每次从列表底部追加 5 条）
+    root = v.tree()
+    left_btn = v.by_id(root, ID_BUTTON)
+    right_btn = v.by_id(root, ID_APPEND)
+    same_row = bool(left_btn and right_btn and left_btn.bounds and right_btn.bounds
+                    and left_btn.bounds[1] == right_btn.bounds[1]
+                    and left_btn.bounds[2] <= right_btn.bounds[0])
+    v.step("底部一行并排两个按钮（左返回 / 右插入）", same_row,
+           f"左 {left_btn.bounds if left_btn else None} / 右 {right_btn.bounds if right_btn else None}",
+           v.shot("11_two_bottom_buttons"))
+
+    # 11. 点右侧按钮：每次从列表底部追加 5 条。
+    #     追加后滚动偏移没变、末尾又长出内容 -> 列表已不在有效底部，
+    #     "内容由AI生成"必须自动隐藏（这是本次要观察的行为）。
+    append_fails: List[str] = []
+    # 条数不写死（前面已经下拉加载过若干批）：只看"每次点击是不是恰好 +5 条"
+    prev_total: Optional[int] = None
+    for i in range(APPEND_CLICKS):
+        try:
+            v.click_append()
+        except RuntimeError as e:
+            append_fails.append(str(e))
+            break
+        root = v.tree()
+        hidden = v.by_text(root, TXT_DISCLAIMER) is None
+        status = v.status_text(root)
+        m = re.search(r"共(\d+)条", status)
+        total = int(m.group(1)) if m else None
+        if not hidden:
+            append_fails.append(f"第 {i + 1} 次插入后提示条仍在（状态「{status}」）")
+        elif not status.startswith(TXT_APPEND_STATUS) or total is None:
+            append_fails.append(f"第 {i + 1} 次插入后状态异常「{status}」")
+        elif prev_total is not None and total != prev_total + 5:
+            append_fails.append(f"第 {i + 1} 次插入条数 {prev_total} -> {total}，不是 +5")
+        if total is not None:
+            prev_total = total
+    v.step("点右侧按钮从底部插入后「内容由AI生成」自动隐藏", not append_fails,
+           f"连点 {APPEND_CLICKS} 次、每次 +5 条，每次都自动隐藏，状态「{v.status_text(v.tree())}」"
+           if not append_fails else "；".join(append_fails),
+           v.shot("12_append_bottom_disclaimer_hidden"))
+
+    # 12. 插完再滚到**新的**有效底部：末条重新落到安全线，提示条恢复显示
+    after_append = v.fling_to_effective_bottom("插入后滚到新的有效底部", "13_settle_after_append")
+    v.step("插入后新底部仍停在安全线且提示条恢复",
+           bool(after_append) and abs(after_append["delta_vs_safe_line_px"]) <= TOLERANCE_PX
+           and bool(after_append.get("disclaimer_visible")),
+           f"偏差 {after_append.get('delta_vs_safe_line_vp')}vp | "
+           f"提示条{'显示' if after_append.get('disclaimer_visible') else '隐藏'}")
+
+    # 13. 圆屏适配：功能性控件的四角都要落在 466x466 圆内（否则会被圆边裁掉）
     root = v.tree()
     last_item = v.by_id(root, ID_LAST_ITEM)
     button = v.by_id(root, ID_BUTTON)
+    append_btn = v.by_id(root, ID_APPEND)
     disclaimer = v.by_text(root, TXT_DISCLAIMER)
-    targets = [("末条", last_item), ("提示条", disclaimer), ("底部按钮", button)]
+    targets = [("末条", last_item), ("提示条", disclaimer),
+               ("底部左按钮", button), ("底部右按钮", append_btn)]
     outside = []
     notes = []
     for label, node in targets:
@@ -538,9 +610,9 @@ def main() -> int:
         notes.append(f"{label}{b}" + (f" 越界角{bad[0]}" if bad else " 全在圆内"))
         if bad:
             outside.append(label)
-    v.step("末条/提示条/底部按钮都落在圆屏内接区域内", not outside,
+    v.step("末条/提示条/底部两个按钮都落在圆屏内接区域内", not outside,
            "；".join(notes) + (f" —— 越界：{outside}" if outside else ""),
-           v.shot("10_circle_containment"))
+           v.shot("14_circle_containment"))
 
     # 顶部状态条是排障用的横条，无法完全躲开圆顶弧（圆在 y=0 处宽度为 0），
     # 系统会把窗口裁成圆形，所以两端被裁掉一部分；这里把它作为已知取舍量出来记录。
@@ -551,6 +623,26 @@ def main() -> int:
         v.notes.append(
             f"顶部状态条 {sb}（宽 {sb[2] - sb[0]}px）：y={sb[1]} 处圆内可用宽度仅 {horizon}px，"
             f"两端会被圆形窗口裁掉 —— 排障用横条的已知取舍；文本内容仍可从控件树完整读到")
+
+    # 14. 左侧按钮功能保持现状：点它仍返回首页（放在最后，因为它会离开本页）
+    back_ok = False
+    back_detail = ""
+    try:
+        node = v.by_id(v.tree(), ID_BUTTON)
+        if node is None or node.bounds is None:
+            back_detail = "量不到底部左按钮"
+        else:
+            cx, cy = node.center()
+            v.drv.click(cx, cy)
+            time.sleep(2.0)
+            root = v.tree()
+            back_ok = v.by_text(root, TXT_ENTRY) is not None
+            back_detail = (f"点击左按钮后 {'回到首页' if back_ok else '没回到首页'}"
+                           f"（{'看到' if back_ok else '看不到'}入口「{TXT_ENTRY}」）")
+    except RuntimeError as e:
+        back_detail = f"点击左按钮失败：{e}"
+    v.step("左侧按钮功能保持现状（返回首页）", back_ok, back_detail,
+           v.shot("15_left_button_back"))
 
     # ---- 报告 ----
     # 截图像素复核：确认每张都是 466x466 的真实画面（不是黑屏/空帧）

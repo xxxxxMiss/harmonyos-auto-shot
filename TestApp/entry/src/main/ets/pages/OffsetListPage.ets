@@ -13,6 +13,9 @@
 //      想让末条离开末尾区域，就用一次幅度够大的滑动把它滑出屏幕（那时不再插手）。
 //      这条是硬约束：以前"用户自己往回划停下就不干预"会导致末条压在提示条上不回弹，
 //      真机反馈"有时候划到顶部没有回弹回来"，现在一律拉回安全线。
+//   5. 底部一排两个按钮：左边返回（原功能），右边每点一次从列表**底部**追加 5 条。
+//      追加后滚动偏移没变、末尾又长出内容 -> 列表已不在有效底部，
+//      "内容由AI生成"立即让位隐藏；滚到新的底部（末条重新升到提示条上方）自动恢复显示。
 //
 // 兼容穿戴设备：
 //   - 交互上全程不用 onTouch（手表上主要是旋转表冠），
@@ -62,6 +65,8 @@ interface OffsetGeometry {
   buttonBottomMargin: number;
   buttonWidth: string;
   buttonFontSize: number;
+  /** 底部两个按钮之间的水平间距（并排放置，整体宽度与原来的单按钮一致） */
+  buttonGap: number;
   /** "内容由AI生成"提示条高度（含流光边框）/ 圆角 / 边框宽度 */
   disclaimerHeight: number;
   disclaimerRadius: number;
@@ -97,6 +102,7 @@ const PHONE_GEOMETRY: OffsetGeometry = {
   buttonBottomMargin: 24,
   buttonWidth: '90%',
   buttonFontSize: 16,
+  buttonGap: 12,
   disclaimerHeight: 30,
   disclaimerRadius: 15,
   disclaimerBorder: 1.5,
@@ -143,6 +149,7 @@ const WEARABLE_GEOMETRY: OffsetGeometry = {
   buttonBottomMargin: 30,
   buttonWidth: '66%',
   buttonFontSize: 10,
+  buttonGap: 8,
   disclaimerHeight: 20,
   disclaimerRadius: 10,
   disclaimerBorder: 1,
@@ -193,8 +200,18 @@ const OVERFLOW_TOLERANCE: number = 0.5;
 const LIST_ID: string = 'offset_list';
 const LAST_ITEM_ID: string = 'offset_last_item';
 const BUTTON_ID: string = 'offset_bottom_button';
+/** 底部右侧按钮（每点一次从列表底部插入 5 条） */
+const APPEND_BUTTON_ID: string = 'offset_append_button';
 /** 提示条不参与几何换算（位置由按钮锚点推出），id 仅用于调试定位 */
 const DISCLAIMER_ID: string = 'offset_disclaimer';
+/** 点击底部右侧按钮时插入的条数 */
+const APPEND_SIZE: number = 5;
+/**
+ * 底部插入后的"布局保护窗"（ms）。
+ * ForEach 重渲染之前，旧末条仍然带着 LAST_ITEM_ID，getRectangleById 量到的还是插入前的位置；
+ * 这期间不允许"末条回到提示条上方"这个条件解锁提示条，否则插入后会被旧布局立刻弹回来。
+ */
+const APPEND_LAYOUT_GUARD_MS: number = 500;
 
 @Entry
 @Component
@@ -242,6 +259,10 @@ struct OffsetListPage {
   private buttonTopPx: number = -1;
   /** 锚点被实测了几次（排障用） */
   private anchorMeasureCount: number = 0;
+  /** 从底部插入数据的波次（排障用） */
+  private appendNo: number = 0;
+  /** 最近一次"从底部插入"的时刻（Date.now()），配合 APPEND_LAYOUT_GUARD_MS 挡旧布局 */
+  private appendAtMs: number = 0;
 
   aboutToAppear(): void {
     const arr: string[] = [];
@@ -422,6 +443,8 @@ struct OffsetListPage {
     }
     const itemBottomPx: number = this.measureLastItemBottomPx();
     if (Number.isNaN(itemBottomPx)) {
+      // 滚动过程中不用在这儿处理：末条往下走会先经过让位窗口、上闩隐藏。
+      // "底部插入新数据"是特例（末尾直接长出内容、末条换人），由 appendAtBottom 主动让位。
       return;
     }
     const ui = this.getUIContext();
@@ -430,7 +453,13 @@ struct OffsetListPage {
     // d > 0：末条底边还在提示条底边下方；d < 0：已经升到提示条底边之上
     const d: number = itemBottomPx - disclaimerBottomPx;
     if (d <= -(heightPx + ui.vp2px(this.geom.disclaimerClear))) {
-      // 末条已经回到提示条上方 -> 恢复显示，并解除"让位"状态
+      // 末条已经回到提示条上方 -> 恢复显示，并解除"让位"状态。
+      // 例外：刚在底部插过数据时，量到的可能还是"插入前的旧末条"（还挂在安全线上），
+      // 这期间不许解锁，否则插入后刚隐藏的提示条会被旧布局立刻弹回来。
+      if (Date.now() - this.appendAtMs < APPEND_LAYOUT_GUARD_MS) {
+        hilog.info(DBG_DOMAIN, DBG_TAG, 'disclaimer: 插入后保护窗内，忽略旧布局的解锁判定');
+        return;
+      }
       this.disclaimerLatched = false;
       this.disclaimerVisible = true;
     } else if (d <= ui.vp2px(this.geom.disclaimerApproach)) {
@@ -578,6 +607,34 @@ struct OffsetListPage {
     this.pendingTarget = -1;
     this.statusText = `已加载 ${this.batchNo * PAGE_SIZE} 条 · 当前共 ${this.items.length} 条`;
     hilog.info(DBG_DOMAIN, DBG_TAG, `loadMore: 第${this.batchNo}批，共 ${this.items.length} 条`);
+  }
+
+  /**
+   * 从列表**底部**插入一批数据（底部右边按钮的功能）。
+   *
+   * 与 loadMore（顶部下拉、插到列表开头）相对：这里是往末尾追加，
+   * 所以插入后"末条"会换成新数据里的最后一条，而它此刻还在屏幕下方。
+   * 数据一变就必须重判提示条：新末条不在显示区里，说明列表已经**不在有效底部**，
+   * "内容由AI生成"不该继续挂在屏上。
+   */
+  private appendAtBottom(): void {
+    this.appendNo++;
+    const fresh: string[] = [];
+    for (let i = 1; i <= APPEND_SIZE; i++) {
+      fresh.push(`底部插入第${this.appendNo}波 · ${i}/${APPEND_SIZE}`);
+    }
+    this.items = this.items.concat(fresh);
+    this.statusText = `已从底部插入 ${this.appendNo * APPEND_SIZE} 条 · 当前共 ${this.items.length} 条`;
+    hilog.info(DBG_DOMAIN, DBG_TAG,
+      `appendAtBottom: 第${this.appendNo}波 +${APPEND_SIZE} 条，共 ${this.items.length} 条`);
+    // 往末尾追加数据、滚动偏移没动 -> 这一刻起列表**一定不在有效底部**了
+    // （末尾又长出 5 条，全在屏幕下方），所以不用等测量：直接让位 + 上闩。
+    // 等用户滚到新的底部、末条重新升到提示条上方，位置判定会自动解锁重新显示。
+    this.appendAtMs = Date.now();
+    this.disclaimerVisible = false;
+    this.disclaimerLatched = true;
+    hilog.info(DBG_DOMAIN, DBG_TAG,
+      `disclaimer: 底部插入新数据（共 ${this.items.length} 条）-> 立即让位隐藏`);
   }
 
   /** 列表是否停在顶部 */
@@ -778,16 +835,35 @@ struct OffsetListPage {
           )
         }
 
-        // 底部固定按钮：悬浮在 List 之上，不随列表滑动
-        Button($r('app.string.offset_bottom_button'))
-          .id(BUTTON_ID)
-          .width(this.geom.buttonWidth)
-          .height(this.geom.buttonHeight)
-          .fontSize(this.geom.buttonFontSize)
-          .margin({ bottom: this.geom.buttonBottomMargin })
-          .onClick(() => {
-            router.back();
-          })
+        // 底部固定按钮：一行并排两个，悬浮在 List 之上，不随列表滑动。
+        //   左：保持原功能（返回上一页），id 仍是 offset_bottom_button——
+        //       它是安全线计算的几何锚点（安全线 = 这排按钮的顶边 - 34vp）。
+        //   右：每点一次从列表**底部**追加 5 条数据。
+        // 整排宽度与原来的单按钮一致（原来的 buttonWidth），每个按钮用 layoutWeight 均分，
+        // 这样圆屏内接区域的检查口径不变。
+        Row({ space: this.geom.buttonGap }) {
+          Button($r('app.string.offset_bottom_button'))
+            .id(BUTTON_ID)
+            .layoutWeight(1)
+            .height(this.geom.buttonHeight)
+            .fontSize(this.geom.buttonFontSize)
+            // 宽度只剩原来一半：长文案允许折行，别被裁成一个省略号
+            .labelStyle({ maxLines: 2, overflow: TextOverflow.Ellipsis })
+            .onClick(() => {
+              router.back();
+            })
+          Button($r('app.string.offset_append_button'))
+            .id(APPEND_BUTTON_ID)
+            .layoutWeight(1)
+            .height(this.geom.buttonHeight)
+            .fontSize(this.geom.buttonFontSize)
+            .labelStyle({ maxLines: 2, overflow: TextOverflow.Ellipsis })
+            .onClick(() => {
+              this.appendAtBottom();
+            })
+        }
+        .width(this.geom.buttonWidth)
+        .margin({ bottom: this.geom.buttonBottomMargin })
       }
       .width('100%')
       .layoutWeight(1)
