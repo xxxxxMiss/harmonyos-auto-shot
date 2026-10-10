@@ -472,7 +472,7 @@ class Verifier:
         宁可在这里明确报错。
         """
         try:
-            serials = HdcDriver.list_devices(self.cfg.get("hdc_path", "hdc"))
+            serials = HdcDriver.list_devices(self.cfg.hdc_path)
         except HdcError as e:
             raise DeviceOfflineError(f"设备离线（{e}）") from None
         if not serials:
@@ -617,8 +617,8 @@ def main() -> int:
         "宽度不小于理论宽度的 75%（否则就是被省略号截断）。")
     v.notes.append(
         "**流式文本用例（底部最右按钮）**：写入目标锁定为**当前末条那一个 listitem**"
-        "（锁定 id，不随「最后一条」漂移），每 350ms 追加 2 个字符（约 5.7 字/s、约 2s 一行），"
-        "一行行把控件撑高；行数上限 12 行，真机验证全程都在长高、不会中途停住。"
+        "（锁定 id，不随「最后一条」漂移），每 350ms 追加 2 个字符（实测约 5~10 字/s、1~2s 一行），"
+        "一行行把控件撑高；行数上限 20 行，真机验证全程都在长高、不会中途停住。"
         "因为数据变更**不产生滚动事件**，所以这一段里没有「每次写入都结算」这种事："
         "① 用户滚到底停下时，硬约束照常把末条收回安全线（第 21 项：末条不会停在安全线上方）；"
         "② 每次回弹之后内容继续长，末条底边会低于安全线一点——这段漂移就是「内容又长出来了」；"
