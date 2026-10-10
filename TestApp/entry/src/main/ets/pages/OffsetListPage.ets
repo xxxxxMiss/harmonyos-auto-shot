@@ -13,9 +13,16 @@
 //      想让末条离开末尾区域，就用一次幅度够大的滑动把它滑出屏幕（那时不再插手）。
 //      这条是硬约束：以前"用户自己往回划停下就不干预"会导致末条压在提示条上不回弹，
 //      真机反馈"有时候划到顶部没有回弹回来"，现在一律拉回安全线。
-//   5. 底部一排两个按钮：左边返回（原功能），右边每点一次从列表**底部**追加 5 条。
+//   5. 底部一排三个按钮：左返回（原功能），中每点一次从列表**底部**追加 5 条，
+//      右模拟"流式文本"——每点一次在"开始写入 / 停止写入"之间切换。
 //      追加后滚动偏移没变、末尾又长出内容 -> 列表已不在有效底部，
 //      "内容由AI生成"立即让位隐藏；滚到新的底部（末条重新升到提示条上方）自动恢复显示。
+//   6. 流式写入（右按钮）：数据持续写进**同一个 ListItem**（末条，文本折行、控件跟着长高），
+//      写入过程中用户一直往上滑。内容是"边长边滚"的，所以：
+//        - 每长一行，末条底边就被顶到安全线下方（这是数据变更，不是滚动，不会自动结算）；
+//        - 用户每次滚动停下时仍按硬约束把末条拉回安全线（回弹不被内容增长打断）；
+//        - 再点一次「停止写入」立即结算一次，把末条拉回安全线（这就是要验证的"还能正常回弹"）。
+//      停止时用 force=false：用户要是已经翻到列表中段（末条不在屏上），不该被拽回底部。
 //
 // 兼容穿戴设备：
 //   - 交互上全程不用 onTouch（手表上主要是旋转表冠），
@@ -65,8 +72,17 @@ interface OffsetGeometry {
   buttonBottomMargin: number;
   buttonWidth: string;
   buttonFontSize: number;
-  /** 底部两个按钮之间的水平间距（并排放置，整体宽度与原来的单按钮一致） */
+  /** 底部按钮之间的水平间距（并排放置，整体宽度与原来的单按钮一致） */
   buttonGap: number;
+  /**
+   * 底部按钮文字的左右内边距。
+   *
+   * 必须显式给一个小值：Button（Capsule）默认左右各 16vp，
+   * 一行并排三个按钮后每个只剩 ~46vp，减去默认内边距就只剩 ~14vp 的文案宽度，
+   * 真机表现为"文字折成两行、第二行被按钮底边裁掉"（实测：文案区仅 68px 宽、
+   * 第二行 glyph 画到按钮外）。给 2vp 后 4 个汉字（36vp）才放得下。
+   */
+  buttonPadding: number;
   /** "内容由AI生成"提示条高度（含流光边框）/ 圆角 / 边框宽度 */
   disclaimerHeight: number;
   disclaimerRadius: number;
@@ -103,6 +119,7 @@ const PHONE_GEOMETRY: OffsetGeometry = {
   buttonWidth: '90%',
   buttonFontSize: 16,
   buttonGap: 12,
+  buttonPadding: 8,
   disclaimerHeight: 30,
   disclaimerRadius: 15,
   disclaimerBorder: 1.5,
@@ -120,7 +137,8 @@ const PHONE_GEOMETRY: OffsetGeometry = {
  * 圆屏上"能不能放得下"由内接矩形决定：离圆心垂直距离 d 处只有 2*sqrt(R²-d²) 宽，
  * 所以越靠上下边缘，可用宽度越窄。下面每个控件都按自己的底边深度验证过：
  *   状态条  y 0~22   ，y=22 处可用 136vp，取 54%=126vp
- *   按钮    y 173~203，底边 d=86.5 处可用 156vp，取 66%=154vp（字号 10，文案刚好放得下）
+ *   按钮    y 173~203，底边 d=86.5 处可用 156vp，取 66%=154vp，
+ *          一行并排三个（每个 ~46vp，文案区 42vp，4 个字 36vp 刚好放得下）
  *   提示条  y 147~167，d=50.5 处可用 210vp，提示条本身仅约 90vp
  *   末条    y 99~139 ，d=22.5 处可用 228vp，整条完整可见
  * 安全线（末条底边落点）= 提示条顶边 147 - lastItemGap 8 = 139vp。
@@ -148,8 +166,11 @@ const WEARABLE_GEOMETRY: OffsetGeometry = {
   buttonHeight: 30,
   buttonBottomMargin: 30,
   buttonWidth: '66%',
-  buttonFontSize: 10,
+  // 一行并排三个按钮，每个只剩 (66% - 2*8) / 3 ≈ 46vp；
+  // 字号 9 + 内边距 2 => 文案区 42vp，4 个汉字 36vp 放得下（字号 10 时 40vp 太挤）
+  buttonFontSize: 9,
   buttonGap: 8,
+  buttonPadding: 2,
   disclaimerHeight: 20,
   disclaimerRadius: 10,
   disclaimerBorder: 1,
@@ -200,11 +221,16 @@ const OVERFLOW_TOLERANCE: number = 0.5;
 const LIST_ID: string = 'offset_list';
 const LAST_ITEM_ID: string = 'offset_last_item';
 const BUTTON_ID: string = 'offset_bottom_button';
-/** 底部右侧按钮（每点一次从列表底部插入 5 条） */
+/** 底部中间按钮（每点一次从列表底部插入 5 条） */
 const APPEND_BUTTON_ID: string = 'offset_append_button';
+/** 底部最右按钮（模拟流式文本：点一次开始写入，再点一次停止并回弹） */
+const STREAM_BUTTON_ID: string = 'offset_stream_button';
+/** 底部按钮文案固定单行：一行并排三个本来就没有折行的空间，
+ *  一旦折行第二行会被 30vp 高的按钮底边裁掉（真机修过的样式问题） */
+const BUTTON_LABEL_MAX_LINES: number = 1;
 /** 提示条不参与几何换算（位置由按钮锚点推出），id 仅用于调试定位 */
 const DISCLAIMER_ID: string = 'offset_disclaimer';
-/** 点击底部右侧按钮时插入的条数 */
+/** 点击底部中间按钮时插入的条数 */
 const APPEND_SIZE: number = 5;
 /**
  * 底部插入后的"布局保护窗"（ms）。
@@ -213,10 +239,45 @@ const APPEND_SIZE: number = 5;
  */
 const APPEND_LAYOUT_GUARD_MS: number = 500;
 
+// ---- 流式文本（底部最右按钮）----
+/** 每两次写入之间的间隔（ms）：模拟逐字下发的流式输出 */
+const STREAM_INTERVAL_MS: number = 150;
+/** 每次写入的字符数 */
+const STREAM_CHARS_PER_TICK: number = 2;
+/** 一轮最多写多少字：写满就在**同一条**里重开一轮（否则末条会无限变高） */
+const STREAM_MAX_CHARS: number = 600;
+/**
+ * 流式写入时这一条允许的最大行数（内容长高的上限）。
+ * 取 20 行（约 336vp）：真机验证全程约 15s、写入速度 13 字/s，末条还在一路长高，
+ * 不会中途碰到上限——这样"停止写入"那一下就一定还有内容增长留下的落差可以回弹。
+ */
+const STREAM_MAX_LINES: number = 20;
+/** 流式写入的语料（循环取字符，模拟模型逐字输出） */
+const STREAM_SENTENCE: string =
+  '这是一段模拟流式输出的文本，用来验证列表内容在持续增长的过程中还能不能正常回弹。';
+
+/**
+ * 列表项数据。
+ *
+ * 必须带一个**稳定 id**：流式写入每 150ms 改一次末条的文本，
+ * 如果还像以前那样用文本本身当 ForEach 的 key，每写一次都会被当成"新数据"，
+ * 整条 ListItem 重建（id 会飘、无法验证"一直在同一个 listitem 里写"），
+ * 而且重建期间 getRectangleById 量到的是旧布局。
+ */
+class OffsetItem {
+  id: number;
+  text: string;
+
+  constructor(id: number, text: string) {
+    this.id = id;
+    this.text = text;
+  }
+}
+
 @Entry
 @Component
 struct OffsetListPage {
-  @State items: string[] = [];
+  @State items: OffsetItem[] = [];
   @State statusText: string = '';
   private scroller: Scroller = new Scroller();
   /** 当前设备的几何参数 */
@@ -263,14 +324,40 @@ struct OffsetListPage {
   private appendNo: number = 0;
   /** 最近一次"从底部插入"的时刻（Date.now()），配合 APPEND_LAYOUT_GUARD_MS 挡旧布局 */
   private appendAtMs: number = 0;
+  /** 列表项自增 id（流式写入需要稳定的 key，不能用文本） */
+  private nextItemId: number = 0;
+
+  /** 流式写入是否进行中（决定最右按钮的文案/颜色，以及末条是否允许折行长高） */
+  @State streaming: boolean = false;
+  /** 流式写入的目标列表项 id：锁定之后一直写这**同一条** */
+  private streamItemId: number = -1;
+  /** 第几轮（一轮写满 STREAM_MAX_CHARS 字就在同一条里重开一轮） */
+  private streamRound: number = 0;
+  /** 本轮已写入的字数 */
+  private streamWritten: number = 0;
+  /** 语料游标 */
+  private streamCursor: number = 0;
+  /** 流式写入定时器句柄（-1 = 没在跑） */
+  private streamTimer: number = -1;
+
+  /** 建一条列表项（自动分配稳定 id） */
+  private newItem(text: string): OffsetItem {
+    this.nextItemId++;
+    return new OffsetItem(this.nextItemId, text);
+  }
 
   aboutToAppear(): void {
-    const arr: string[] = [];
+    const arr: OffsetItem[] = [];
     for (let i = 1; i <= INITIAL_COUNT; i++) {
-      arr.push(`初始 Mock 数据 #${i}`);
+      arr.push(this.newItem(`初始 Mock 数据 #${i}`));
     }
     this.items = arr;
     this.statusText = `共 ${arr.length} 条 · contentEndOffset=${this.geom.contentEndOffset}vp`;
+  }
+
+  /** 页面销毁（返回上一页）时一定要停掉定时器，否则离开页面后还在写 */
+  aboutToDisappear(): void {
+    this.clearStreamTimer();
   }
 
   /** 提示条相对列表底边的 margin：正好落在按钮正上方 */
@@ -599,9 +686,9 @@ struct OffsetListPage {
   /** 加载下一页：插入到列表开头（同步插入，不做假延时） */
   private loadMore(): void {
     this.batchNo++;
-    const fresh: string[] = [];
+    const fresh: OffsetItem[] = [];
     for (let i = 1; i <= PAGE_SIZE; i++) {
-      fresh.push(`下拉加载第${this.batchNo}批 · ${i}/${PAGE_SIZE}`);
+      fresh.push(this.newItem(`下拉加载第${this.batchNo}批 · ${i}/${PAGE_SIZE}`));
     }
     this.items = fresh.concat(this.items);
     this.pendingTarget = -1;
@@ -619,9 +706,9 @@ struct OffsetListPage {
    */
   private appendAtBottom(): void {
     this.appendNo++;
-    const fresh: string[] = [];
+    const fresh: OffsetItem[] = [];
     for (let i = 1; i <= APPEND_SIZE; i++) {
-      fresh.push(`底部插入第${this.appendNo}波 · ${i}/${APPEND_SIZE}`);
+      fresh.push(this.newItem(`底部插入第${this.appendNo}波 · ${i}/${APPEND_SIZE}`));
     }
     this.items = this.items.concat(fresh);
     this.statusText = `已从底部插入 ${this.appendNo * APPEND_SIZE} 条 · 当前共 ${this.items.length} 条`;
@@ -635,6 +722,133 @@ struct OffsetListPage {
     this.disclaimerLatched = true;
     hilog.info(DBG_DOMAIN, DBG_TAG,
       `disclaimer: 底部插入新数据（共 ${this.items.length} 条）-> 立即让位隐藏`);
+  }
+
+  // ---- 流式文本（底部最右按钮）----
+
+  /** 最右按钮：不在写 -> 开始写；正在写 -> 停止并立即结算（回弹） */
+  private toggleStream(): void {
+    if (this.streaming) {
+      this.stopStream();
+    } else {
+      this.startStream();
+    }
+  }
+
+  private clearStreamTimer(): void {
+    if (this.streamTimer >= 0) {
+      clearInterval(this.streamTimer);
+      this.streamTimer = -1;
+    }
+  }
+
+  /**
+   * 开始流式写入：目标锁定为**当前末条**，此后 150ms 往这一条追加一次字符。
+   *
+   * 锁定 id 而不是"每次都取最后一条"：这样即使用户中途点了"插入5条"，
+   * 写入对象仍然是同一个 listitem（诉求就是"一直往一个 listitem 中写入数据"）。
+   */
+  private startStream(): void {
+    if (this.items.length === 0) {
+      return;
+    }
+    this.clearStreamTimer();
+    this.streaming = true;
+    this.streamRound++;
+    this.streamWritten = 0;
+    this.streamCursor = 0;
+    this.streamItemId = this.items[this.items.length - 1].id;
+    this.setStreamItemText(`流式输出 ${this.streamRound}：`);
+    this.statusText = `流式写入中 · 第${this.streamRound}轮 · 0 字`;
+    hilog.info(DBG_DOMAIN, DBG_TAG,
+      `stream: 开始写入 itemId=${this.streamItemId}（第${this.streamRound}轮）`);
+    // 写入不改滚动偏移 -> 不会触发 onScrollStop，所以每写一次要自己刷一次提示条
+    this.streamTimer = setInterval(() => {
+      this.streamTick();
+    }, STREAM_INTERVAL_MS);
+  }
+
+  /**
+   * 停止流式写入并**立即结算一次**。
+   *
+   * 这是本次要验证的关键动作：内容一直在长，末条被一行行顶到安全线下方
+   * （数据变更不产生滚动事件，所以期间没有任何一次自动回弹）；
+   * 停止时按当前实测结算 -> 末条立刻回弹到安全线。
+   *
+   * force=false：如果用户已经翻到列表中段（末条不在屏上），不要把他拽回底部。
+   */
+  private stopStream(): void {
+    this.clearStreamTimer();
+    this.streaming = false;
+    this.statusText = `流式写入已停止 · ${this.streamRound} 轮 · 末条 ${this.streamWritten} 字`;
+    hilog.info(DBG_DOMAIN, DBG_TAG,
+      `stream: 停止写入（第${this.streamRound}轮，本轮 ${this.streamWritten} 字）-> 立即结算`);
+    // 停下来了，重新量一次锚点（内容长高可能已经改过布局）
+    this.buttonTopPx = -1;
+    this.settleAtEffectiveBottom(true, false);
+    this.updateDisclaimerVisibility();
+  }
+
+  /** 一次写入：往锁定项追加 STREAM_CHARS_PER_TICK 个字；写满一轮就在同一条里重开 */
+  private streamTick(): void {
+    if (this.streamItemId < 0) {
+      this.clearStreamTimer();
+      return;
+    }
+    if (this.streamWritten >= STREAM_MAX_CHARS) {
+      // 写满一轮：同一条重新开始，否则末条会一直长高、把整个可视区吃光
+      this.streamRound++;
+      this.streamWritten = 0;
+      this.streamCursor = 0;
+      this.setStreamItemText(`流式输出 ${this.streamRound}：`);
+      this.statusText = `流式写入中 · 第${this.streamRound}轮（上一轮写满 ${STREAM_MAX_CHARS} 字，同一条重开）`;
+      hilog.info(DBG_DOMAIN, DBG_TAG, `stream: 第${this.streamRound}轮（同一条重开）`);
+      return;
+    }
+    let chunk: string = '';
+    for (let i = 0; i < STREAM_CHARS_PER_TICK; i++) {
+      chunk += STREAM_SENTENCE.charAt(this.streamCursor % STREAM_SENTENCE.length);
+      this.streamCursor++;
+    }
+    this.streamWritten += STREAM_CHARS_PER_TICK;
+    const text: string = this.findStreamItemText();
+    if (text.length === 0) {
+      hilog.info(DBG_DOMAIN, DBG_TAG, 'stream: 目标列表项已不在，停止写入');
+      this.stopStream();
+      return;
+    }
+    this.setStreamItemText(text + chunk);
+    this.statusText = `流式写入中 · 第${this.streamRound}轮 · ${this.streamWritten} 字`;
+    // 末条被顶到提示条跟前时提示条要让位；这里量到的可能是"这一次增长之前"的布局，
+    // 但让位判定是上闩的（只会更早隐藏、不会来回抖），下一帧/下一次滚动会自然对齐。
+    this.updateDisclaimerVisibility();
+  }
+
+  /** 锁定项的当前文本，找不到返回空串 */
+  private findStreamItemText(): string {
+    for (let i = 0; i < this.items.length; i++) {
+      if (this.items[i].id === this.streamItemId) {
+        return this.items[i].text;
+      }
+    }
+    return '';
+  }
+
+  /** 这一条是不是当前流式写入的目标（目标项允许折行、跟着内容长高） */
+  private isStreamTarget(item: OffsetItem): boolean {
+    return this.streaming && item.id === this.streamItemId;
+  }
+
+  /** 改写锁定项的文本（换新数组 + 换新对象：数组元素替换会触发 @State 刷新） */
+  private setStreamItemText(text: string): void {
+    for (let i = 0; i < this.items.length; i++) {
+      if (this.items[i].id === this.streamItemId) {
+        const copy: OffsetItem[] = this.items.slice();
+        copy[i] = new OffsetItem(this.streamItemId, text);
+        this.items = copy;
+        return;
+      }
+    }
   }
 
   /** 列表是否停在顶部 */
@@ -665,7 +879,7 @@ struct OffsetListPage {
 
       Stack({ alignContent: Alignment.Bottom }) {
         List({ space: this.geom.itemSpace, scroller: this.scroller }) {
-          ForEach(this.items, (item: string, idx: number) => {
+          ForEach(this.items, (item: OffsetItem, idx: number) => {
             ListItem() {
               Row({ space: this.geom.itemRowSpace }) {
                 Text(`${idx + 1}`)
@@ -676,12 +890,14 @@ struct OffsetListPage {
                   .height(this.geom.badgeSize)
                   .borderRadius(this.geom.badgeSize / 2)
                   .backgroundColor(idx === this.items.length - 1 ? '#E64545' : '#8C8C8C')
-                Text(item)
+                Text(item.text)
                   .fontSize(this.geom.itemFontSize)
                   .fontColor('#333333')
                   .layoutWeight(1)
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .maxLines(this.isStreamTarget(item) ? STREAM_MAX_LINES : 1)
+                  .textOverflow({
+                    overflow: this.isStreamTarget(item) ? TextOverflow.Clip : TextOverflow.Ellipsis
+                  })
                 if (idx === this.items.length - 1) {
                   Text('末条')
                     .fontSize(this.geom.tagFontSize)
@@ -689,7 +905,9 @@ struct OffsetListPage {
                 }
               }
               .width('100%')
-              .height(this.geom.itemHeight)
+              // 普通项：内容撑不到项高，用 minHeight 兜住；
+              // 流式写入那一项：文本一行行长出来，整条跟着变高（minHeight 不再起作用）
+              .constraintSize({ minHeight: this.geom.itemHeight })
               .padding({ left: this.geom.itemPadding, right: this.geom.itemPadding })
               .backgroundColor(idx === this.items.length - 1 ? '#FFF1F0' : '#F2F3F5')
               .borderRadius(8)
@@ -700,7 +918,7 @@ struct OffsetListPage {
             }
             // 末条单独一个 id，供 getRectangleById 实测位置
             .id(idx === this.items.length - 1 ? LAST_ITEM_ID : `offset_item_${idx}`)
-          }, (item: string) => item)
+          }, (item: OffsetItem) => `${item.id}`)
         }
         .width('100%')
         .height('100%')
@@ -835,20 +1053,25 @@ struct OffsetListPage {
           )
         }
 
-        // 底部固定按钮：一行并排两个，悬浮在 List 之上，不随列表滑动。
+        // 底部固定按钮：一行并排三个，悬浮在 List 之上，不随列表滑动。
         //   左：保持原功能（返回上一页），id 仍是 offset_bottom_button——
         //       它是安全线计算的几何锚点（安全线 = 这排按钮的顶边 - 34vp）。
-        //   右：每点一次从列表**底部**追加 5 条数据。
-        // 整排宽度与原来的单按钮一致（原来的 buttonWidth），每个按钮用 layoutWeight 均分，
-        // 这样圆屏内接区域的检查口径不变。
+        //   中：每点一次从列表**底部**追加 5 条数据。
+        //   右：模拟流式文本——点一次在"开始写入 / 停止写入"之间切换，
+        //       写入目标是**同一个 listitem**（末条），停止时立即结算回弹。
+        // 整排宽度与原来的单按钮一致（原来的 buttonWidth），每个按钮用 layoutWeight 均分。
+        //
+        // 样式注意（真机修过）：一行三个后每个只剩 ~46vp，而 Button(Capsule) 默认左右
+        // 各 16vp 内边距 -> 文案区只剩 ~14vp，真机表现为"文案折成两行、第二行被 30vp 高的
+        // 按钮底边裁掉"。所以这里显式压小内边距 + 文案固定单行（标签也相应改短）。
         Row({ space: this.geom.buttonGap }) {
           Button($r('app.string.offset_bottom_button'))
             .id(BUTTON_ID)
             .layoutWeight(1)
             .height(this.geom.buttonHeight)
             .fontSize(this.geom.buttonFontSize)
-            // 宽度只剩原来一半：长文案允许折行，别被裁成一个省略号
-            .labelStyle({ maxLines: 2, overflow: TextOverflow.Ellipsis })
+            .padding({ left: this.geom.buttonPadding, right: this.geom.buttonPadding })
+            .labelStyle({ maxLines: BUTTON_LABEL_MAX_LINES, overflow: TextOverflow.Ellipsis })
             .onClick(() => {
               router.back();
             })
@@ -857,9 +1080,21 @@ struct OffsetListPage {
             .layoutWeight(1)
             .height(this.geom.buttonHeight)
             .fontSize(this.geom.buttonFontSize)
-            .labelStyle({ maxLines: 2, overflow: TextOverflow.Ellipsis })
+            .padding({ left: this.geom.buttonPadding, right: this.geom.buttonPadding })
+            .labelStyle({ maxLines: BUTTON_LABEL_MAX_LINES, overflow: TextOverflow.Ellipsis })
             .onClick(() => {
               this.appendAtBottom();
+            })
+          Button(this.streaming ? $r('app.string.offset_stream_stop_button')
+            : $r('app.string.offset_stream_button'))
+            .id(STREAM_BUTTON_ID)
+            .layoutWeight(1)
+            .height(this.geom.buttonHeight)
+            .fontSize(this.geom.buttonFontSize)
+            .padding({ left: this.geom.buttonPadding, right: this.geom.buttonPadding })
+            .labelStyle({ maxLines: BUTTON_LABEL_MAX_LINES, overflow: TextOverflow.Ellipsis })
+            .onClick(() => {
+              this.toggleStream();
             })
         }
         .width(this.geom.buttonWidth)

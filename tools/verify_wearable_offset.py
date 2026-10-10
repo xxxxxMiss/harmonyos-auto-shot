@@ -41,10 +41,13 @@ TESTAPP = os.path.join(REPO_ROOT, "TestApp")
 # ---- 与 OffsetListPage.WEARABLE_GEOMETRY 保持一致（改那边记得同步）----
 BUTTON_HEIGHT = 30
 BUTTON_BOTTOM_MARGIN = 30
+BUTTON_FONT_VP = 9         # 一行并排三个按钮，字号被压到 9vp
+BUTTON_PADDING_VP = 2      # 显式内边距（Button 默认左右各 16vp，会把文案挤到折行/裁切）
 DISCLAIMER_BOTTOM_GAP = 6
 DISCLAIMER_HEIGHT = 20
 LAST_ITEM_GAP = 8
 ITEM_HEIGHT = 40
+ITEM_FONT_VP = 12
 CONTENT_START_OFFSET = 12
 CONTENT_END_OFFSET = 160
 # 安全线（末条底边落点）相对按钮顶边的距离
@@ -64,6 +67,7 @@ ID_LAST_ITEM = "offset_last_item"
 ID_BUTTON = "offset_bottom_button"
 ID_LIST = "offset_list"
 ID_APPEND = "offset_append_button"
+ID_STREAM = "offset_stream_button"
 
 TXT_DISCLAIMER = "内容由AI生成"
 TXT_ENTRY = "偏移列表（触底回弹）"
@@ -71,7 +75,16 @@ TXT_LOADED_PREFIX = "下拉加载第"
 TXT_LAST_MOCK = "初始 Mock 数据 #30"
 TXT_TOP_SETTLE = "自动滚回底部"
 TXT_APPEND_STATUS = "已从底部插入"
-APPEND_CLICKS = 6          # 连点右侧按钮的次数（每次 +5 条）
+TXT_STREAM_STATUS = "流式写入"
+TXT_STREAM_STOP = "停止写入"
+APPEND_CLICKS = 6          # 连点中间按钮的次数（每次 +5 条）
+
+# 流式写入期间允许的漂移上限（px）：写入不改滚动偏移、只有滚动停止才结算，
+# 所以"上一次回弹之后内容又长了几行"会体现为末条底边低于安全线。
+# STREAM_MAX_LINES=6、项高 40vp、行高约 1.4*12vp -> 最多约 (6 行 - 1 行) * 34px ≈ 170px。
+# 每次测量都在"甩到底 -> 回弹 -> 又写了 ~2.5s"之后：约 13 字/s、13 字/行 -> 最多约 2.5 行 * 34px ≈ 85px，
+# 取 180px 留足余量（注意这不是"整条能长多高"，那由 OffsetListPage.STREAM_MAX_LINES 决定）。
+STREAM_DRIFT_MAX_PX = 180
 
 
 class Verifier:
@@ -124,7 +137,8 @@ class Verifier:
     @staticmethod
     def status_text(root: L.Node) -> str:
         """顶部状态条：本页的调试文案（不含列表项与提示条）。"""
-        marks = ("contentEndOffset", "自动滚回", "已加载", "滚动极限", TXT_APPEND_STATUS)
+        marks = ("contentEndOffset", "自动滚回", "已加载", "滚动极限", TXT_APPEND_STATUS,
+                 TXT_STREAM_STATUS)
         best = ""
         for n in L.iter_nodes(root):
             t = L.normalize_text(n.text)
@@ -173,13 +187,20 @@ class Verifier:
         time.sleep(2.2)
 
     def click_append(self) -> tuple:
-        """点底部右侧按钮（从列表底部追加 5 条）。返回按钮中心坐标。"""
-        node = self.by_id(self.tree(), ID_APPEND)
+        """点底部中间按钮（从列表底部追加 5 条）。返回按钮中心坐标。"""
+        return self.click_button(ID_APPEND, "底部中间按钮 offset_append_button")
+
+    def click_stream(self) -> tuple:
+        """点底部最右按钮（流式写入：开始 / 停止）。返回按钮中心坐标。"""
+        return self.click_button(ID_STREAM, "底部最右按钮 offset_stream_button")
+
+    def click_button(self, node_id: str, label: str) -> tuple:
+        node = self.by_id(self.tree(), node_id)
         if node is None or node.bounds is None:
-            raise RuntimeError("量不到底部右侧按钮 offset_append_button")
+            raise RuntimeError(f"量不到{label}")
         cx, cy = node.center()
         if (cx - CX_PX) ** 2 + (cy - R_PX) ** 2 > (R_PX - 12) ** 2:
-            raise RuntimeError(f"右侧按钮中心 ({cx},{cy}) 落在圆外，点不到")
+            raise RuntimeError(f"{label}中心 ({cx},{cy}) 落在圆外，点不到")
         self.drv.click(cx, cy)
         time.sleep(1.2)
         return cx, cy
@@ -274,6 +295,131 @@ class Verifier:
         lb = lst.bounds
         visible = ib[3] > lb[1] and ib[1] < lb[3]
         return visible, f"末条 {ib} / 列表 {lb} -> {'仍在显示区内' if visible else '已滑出显示区'}"
+
+    @staticmethod
+    def subtree_text(node: L.Node) -> str:
+        """节点及其子树的文本拼起来（ListItem 自己没文本，文本在子节点里）。"""
+        parts: List[str] = []
+        for n in L.iter_nodes(node):
+            t = L.normalize_text(n.text)
+            if t:
+                parts.append(t)
+        return "".join(parts)
+
+    def last_item_state(self) -> tuple:
+        """末条的（子树文本, 控件高度 px）：流式写入用它证明"同一条在变长"。"""
+        node = self.by_id(self.tree(), ID_LAST_ITEM)
+        if node is None or node.bounds is None:
+            return "", 0
+        b = node.bounds
+        return self.subtree_text(node), b[3] - b[1]
+
+    def observe_disclaimer_hidden(self, shot_name: str, timeout: float = 6.0,
+                                  interval: float = 0.4) -> tuple:
+        """流式写入过程中轮询：内容把末条顶到提示条附近时，提示条应该让位（节点消失）。"""
+        deadline = time.time() + timeout
+        samples = 0
+        while time.time() < deadline:
+            samples += 1
+            try:
+                if self.by_text(self.tree(), TXT_DISCLAIMER) is None:
+                    return (True, f"轮询 {samples} 次后提示条节点消失（内容增长期间让位生效）",
+                            self.shot(shot_name))
+            except RuntimeError:
+                continue
+            time.sleep(interval)
+        return False, f"轮询 {samples} 次，提示条始终在屏上（内容增长没有触发让位）", ""
+
+    def wait_stream_drift(self, want_px: int, timeout: float = 6.0,
+                          interval: float = 0.3) -> tuple:
+        """等"内容增长"把末条顶到安全线下方 want_px 以上。
+
+        流式写入不改滚动偏移、也不产生滚动事件，所以这一段时间里**没有任何一次自动结算**——
+        漂移会一直累积，正好用来验证"停止写入"那一下能不能一次收回来。
+        """
+        deadline = time.time() + timeout
+        last = 0
+        while time.time() < deadline:
+            try:
+                m = self.measure()
+            except RuntimeError as e:
+                return 0, f"量不到末条：{e}"
+            last = m["delta_vs_safe_line_px"]
+            if last >= want_px:
+                return last, f"漂移累积到 {last}px（写入期间不会自动结算）"
+            time.sleep(interval)
+        return last, f"{timeout}s 内漂移只到 {last}px"
+
+    def button_label(self, node_id: str) -> str:
+        """按钮控件树上的文案（读不到返回空串：只用于报告，不单独作为失败判据）。"""
+        node = self.by_id(self.tree(), node_id)
+        return L.normalize_text(node.text) if node is not None else ""
+
+    def check_button_labels(self, shot_path: str, targets: List[tuple]) -> tuple:
+        """像素复核底部按钮的文案：必须**单行、完整、不贴边**。
+
+        被测的真机问题：一行并排三个按钮后每个只剩 ~46vp，而 Button(Capsule) 默认左右
+        各 16vp 内边距，文案区只剩 ~14vp -> 文案折成两行，30vp 高的按钮把第二行裁掉
+        （实测：文案区仅 68px 宽，第二行 glyph 画到按钮底边之外）。
+
+        targets: [(标签, 控件节点, 兜底文案)]，兜底文案用于控件树读不到按钮文本时估算理论宽度。
+        判据（白字画在蓝色按钮上，所以"文字像素"= 三通道都 > 190）：
+          1) 有文字像素；
+          2) 文字像素的行集合是**一段连续带**（行内空隙 <= 4px）=> 只有一行；
+          3) 上/下各留 >= 4px，左/右各留 >= 2px => 没有被按钮边界裁切；
+          4) 文字宽度 >= 0.75 * 理论宽度（汉字按 1 个字宽、ASCII 按 0.55）=> 不是被省略号截断的。
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            return True, "没装 Pillow，跳过按钮文案像素复核"
+        im = Image.open(shot_path).convert("RGB")
+        notes: List[str] = []
+        bad: List[str] = []
+        for label, node, expect in targets:
+            if node is None or node.bounds is None:
+                bad.append(f"{label}(量不到)")
+                continue
+            text = L.normalize_text(node.text) or expect
+            b = node.bounds
+            crop = im.crop((b[0], b[1], b[2], b[3]))
+            w, h = crop.size
+            px = crop.load()
+            rows: List[int] = []
+            cols: List[int] = []
+            for y in range(h):
+                for x in range(w):
+                    r, g, bl = px[x, y]
+                    if r > 190 and g > 190 and bl > 190:
+                        rows.append(y)
+                        cols.append(x)
+            if not rows:
+                bad.append(f"{label}「{text}」按钮里量不到文字像素")
+                continue
+            row_set = sorted(set(rows))
+            gaps = [b2 - a2 for a2, b2 in zip(row_set, row_set[1:])]
+            max_gap = max(gaps) if gaps else 0
+            top, bottom = row_set[0], h - 1 - row_set[-1]
+            left, right = min(cols), w - 1 - max(cols)
+            want = 0.0
+            for ch in text:
+                want += BUTTON_FONT_VP * PX_PER_VP * (1.0 if ord(ch) > 0x2E80 else 0.55)
+            ink_w = max(cols) - min(cols) + 1
+            probs: List[str] = []
+            if max_gap > 4:
+                probs.append(f"文字分成多行（行间空隙 {max_gap}px）")
+            if top < 4 or bottom < 4:
+                probs.append(f"文字贴边被裁（上 {top}px / 下 {bottom}px）")
+            if left < 2 or right < 2:
+                probs.append(f"文字贴左右边（左 {left}px / 右 {right}px）")
+            if want > 0 and ink_w < 0.75 * want:
+                probs.append(f"文字宽度只有 {ink_w}px，理论 {want:.0f}px（疑似省略号截断）")
+            notes.append(f"{label}「{text}」{b} 文字 {ink_w}x{row_set[-1] - row_set[0] + 1}px"
+                         f" 上{top}/下{bottom}/左{left}/右{right}"
+                         + (f" —— {'；'.join(probs)}" if probs else " 单行完整"))
+            if probs:
+                bad.append(label)
+        return not bad, "；".join(notes) + (f" —— 异常：{bad}" if bad else "")
 
     # ---- 步骤 ----
     def step(self, name: str, ok: bool, detail: str, shot: Optional[str] = None) -> None:
@@ -393,11 +539,30 @@ def main() -> int:
         f"{211 - CONTENT_START_OFFSET - CONTENT_END_OFFSET}vp 余量后正常。"
         f"手机参数 24+520=544 远小于手机列表高度，不受影响。")
     v.notes.append(
+        "**底部按钮文案样式（本次修复）**：一行并排三个按钮后每个只剩约 46vp，"
+        "而 Button(Capsule) 默认左右各 16vp 内边距，文案区只剩约 14vp——真机表现为"
+        "「文案折成两行、第二行被 30vp 高的按钮底边裁掉」（实测：文案区仅 68px 宽、"
+        "第二行 glyph 画到按钮底边之外；两个按钮都只剩 3 个字 + 省略号）。"
+        "修法：① 文案改短（返回 / 插入5条 / 流式写入 / 停止写入）；"
+        "② 显式 padding 左右各 2vp；③ 文案固定单行（maxLines=1）；④ 穿戴字号 10->9vp。"
+        "本脚本第 15 项用**截图像素**复核：文字像素必须单行、上下各留 4px、左右各留 2px、"
+        "宽度不小于理论宽度的 75%（否则就是被省略号截断）。")
+    v.notes.append(
+        "**流式文本用例（底部最右按钮）**：写入目标锁定为**当前末条那一个 listitem**"
+        "（锁定 id，不随「最后一条」漂移），每 150ms 追加 2 个字符，一行行把控件撑高。"
+        "因为数据变更**不产生滚动事件**，所以这一段里没有任何自动结算："
+        "① 用户滚到底停下时，硬约束照常把末条收回安全线（第 16 项：末条不会停在安全线上方）；"
+        "② 每次回弹之后内容继续长，末条底边会低于安全线一点——这段漂移是「内容又长出来了」，"
+        f"上限取 {STREAM_DRIFT_MAX_PX}px（每次测量点都在回弹后约 2.5s，约 2.5 行的增长量）；"
+        "③ 点「停止写入」那一下立即结算，末条一次收回到安全线（第 18 项，偏差 0）。"
+        "停止用的是 force=false：用户要是已经翻到列表中段（末条不在屏上），不该被拽回底部。"
+        "项高不再是固定值：普通项用 constraintSize(minHeight) 兜住 40vp，流式那一项随文本长高。")
+    v.notes.append(
         "为让整行不被圆边裁掉，穿戴参数下给 List 加了左右各 8vp 内缩（listPadding，手机为 0）；"
         "该内缩只影响水平方向，安全线是纵向计算，不受影响。")
     v.notes.append(
-        "本次只连了手表（hdc 上只有 NIZ-AL00），手机几何参数 PHONE_GEOMETRY 未改动、**未重新真机验证**；"
-        "但安全线口径修正（safeLineInsetFromButtonTop 不再误用 disclaimerMargin）同时作用于手机，"
+        "本次只连了手表（hdc 上只有 NIZ-AL00），手机几何参数 PHONE_GEOMETRY **未重新真机验证**"
+        "（按钮文案与内边距同步改短/压小，手机按钮宽度 90%/3 ≈ 100vp，文案仍单行放得下）；"
         "接入手机后建议重跑一次本脚本（把几何常量换成手机那套）。")
     v.notes.append(
         "**回弹硬约束（本次用户诉求「不管怎样一定要回弹回来」）**：末条只要还在列表显示区内，就不允许停在"
@@ -414,7 +579,7 @@ def main() -> int:
         "只看 size.height 会把「早就不在屏上」误判成「还在屏上」，导致用户往列表中部翻也被拽回底部——"
         "现在显式用「末条矩形与列表矩形有交集」判可见性。")
     v.notes.append(
-        "**底部右侧按钮（从列表底部追加 5 条）与提示条**：追加时滚动偏移没变、末尾又长出内容，"
+        "**底部中间按钮（从列表底部追加 5 条）与提示条**：追加时滚动偏移没变、末尾又长出内容，"
         "所以这一刻列表已经不在有效底部——`OffsetListPage.appendAtBottom` 不等测量直接让位隐藏并上闩，"
         "避免「插入瞬间 ForEach 还没重渲染、量到的仍是插入前的旧末条（还挂在安全线上）」把提示条弹回来"
         "（真机实测过这个竞态：固定延时 120ms 重判，3 轮里会漏 1 次）。"
@@ -541,18 +706,33 @@ def main() -> int:
            bool(fourth) and abs(fourth["delta_vs_safe_line_px"]) <= TOLERANCE_PX,
            f"偏差 {fourth.get('delta_vs_safe_line_vp')}vp")
 
-    # 10. 底部按钮改成一行并排两个（左：原功能返回；右：每次从列表底部追加 5 条）
+    # 10. 底部按钮改成一行并排三个（左：原功能返回；中：从底部追加 5 条；右：模拟流式文本）
     root = v.tree()
     left_btn = v.by_id(root, ID_BUTTON)
-    right_btn = v.by_id(root, ID_APPEND)
-    same_row = bool(left_btn and right_btn and left_btn.bounds and right_btn.bounds
-                    and left_btn.bounds[1] == right_btn.bounds[1]
-                    and left_btn.bounds[2] <= right_btn.bounds[0])
-    v.step("底部一行并排两个按钮（左返回 / 右插入）", same_row,
-           f"左 {left_btn.bounds if left_btn else None} / 右 {right_btn.bounds if right_btn else None}",
-           v.shot("11_two_bottom_buttons"))
+    mid_btn = v.by_id(root, ID_APPEND)
+    right_btn = v.by_id(root, ID_STREAM)
+    row_ok = bool(left_btn and mid_btn and right_btn
+                  and left_btn.bounds and mid_btn.bounds and right_btn.bounds
+                  and left_btn.bounds[1] == mid_btn.bounds[1] == right_btn.bounds[1]
+                  and left_btn.bounds[3] == mid_btn.bounds[3] == right_btn.bounds[3]
+                  and left_btn.bounds[2] <= mid_btn.bounds[0]
+                  and mid_btn.bounds[2] <= right_btn.bounds[0])
+    v.step("底部一行并排三个按钮（左返回 / 中插入 / 右流式）", row_ok,
+           f"左 {left_btn.bounds if left_btn else None} / 中 {mid_btn.bounds if mid_btn else None}"
+           f" / 右 {right_btn.bounds if right_btn else None}",
+           v.shot("14_three_bottom_buttons"))
 
-    # 11. 点右侧按钮：每次从列表底部追加 5 条。
+    # 11. 按钮文案样式（像素复核）：一行并排三个后每个只剩 ~46vp，必须单行、完整、不贴边。
+    #     真机问题：Button 默认左右各 16vp 内边距把文案区压到 ~14vp，文案折成两行、
+    #     第二行被 30vp 高的按钮底边裁掉（实测文案区仅 68px 宽）。
+    style_shot = v.shot("15_button_label_style")
+    style_ok, style_detail = v.check_button_labels(
+        style_shot, [("左按钮", left_btn, "返回"), ("中按钮", mid_btn, "插入5条"),
+                     ("右按钮", right_btn, "流式写入")])
+    v.step("底部按钮文案单行完整显示（像素复核：不折行/不裁切/不省略）",
+           style_ok, style_detail, style_shot)
+
+    # 12. 点中间按钮：每次从列表底部追加 5 条。
     #     追加后滚动偏移没变、末尾又长出内容 -> 列表已不在有效底部，
     #     "内容由AI生成"必须自动隐藏（这是本次要观察的行为）。
     append_fails: List[str] = []
@@ -577,27 +757,28 @@ def main() -> int:
             append_fails.append(f"第 {i + 1} 次插入条数 {prev_total} -> {total}，不是 +5")
         if total is not None:
             prev_total = total
-    v.step("点右侧按钮从底部插入后「内容由AI生成」自动隐藏", not append_fails,
+    v.step("点中间按钮从底部插入后「内容由AI生成」自动隐藏", not append_fails,
            f"连点 {APPEND_CLICKS} 次、每次 +5 条，每次都自动隐藏，状态「{v.status_text(v.tree())}」"
            if not append_fails else "；".join(append_fails),
-           v.shot("12_append_bottom_disclaimer_hidden"))
+           v.shot("16_append_bottom_disclaimer_hidden"))
 
     # 12. 插完再滚到**新的**有效底部：末条重新落到安全线，提示条恢复显示
-    after_append = v.fling_to_effective_bottom("插入后滚到新的有效底部", "13_settle_after_append")
+    after_append = v.fling_to_effective_bottom("插入后滚到新的有效底部", "17_settle_after_append")
     v.step("插入后新底部仍停在安全线且提示条恢复",
            bool(after_append) and abs(after_append["delta_vs_safe_line_px"]) <= TOLERANCE_PX
            and bool(after_append.get("disclaimer_visible")),
            f"偏差 {after_append.get('delta_vs_safe_line_vp')}vp | "
            f"提示条{'显示' if after_append.get('disclaimer_visible') else '隐藏'}")
 
-    # 13. 圆屏适配：功能性控件的四角都要落在 466x466 圆内（否则会被圆边裁掉）
+    # 14. 圆屏适配：功能性控件的四角都要落在 466x466 圆内（否则会被圆边裁掉）
     root = v.tree()
     last_item = v.by_id(root, ID_LAST_ITEM)
     button = v.by_id(root, ID_BUTTON)
     append_btn = v.by_id(root, ID_APPEND)
+    stream_btn = v.by_id(root, ID_STREAM)
     disclaimer = v.by_text(root, TXT_DISCLAIMER)
     targets = [("末条", last_item), ("提示条", disclaimer),
-               ("底部左按钮", button), ("底部右按钮", append_btn)]
+               ("底部左按钮", button), ("底部中按钮", append_btn), ("底部右按钮", stream_btn)]
     outside = []
     notes = []
     for label, node in targets:
@@ -610,12 +791,105 @@ def main() -> int:
         notes.append(f"{label}{b}" + (f" 越界角{bad[0]}" if bad else " 全在圆内"))
         if bad:
             outside.append(label)
-    v.step("末条/提示条/底部两个按钮都落在圆屏内接区域内", not outside,
+    v.step("末条/提示条/底部三个按钮都落在圆屏内接区域内", not outside,
            "；".join(notes) + (f" —— 越界：{outside}" if outside else ""),
-           v.shot("14_circle_containment"))
+           v.shot("19_circle_containment"))
+
+    # ---- 流式文本（底部最右按钮）：模拟"一直往一个 listitem 里写数据" ----
+    # 20. 点最右按钮开始写入：内容写进**同一个 listitem**（末条），文本持续变长、控件跟着长高
+    stream_ok = False
+    stream_detail = ""
+    try:
+        v.click_stream()
+        time.sleep(0.3)
+        text_a, h_a = v.last_item_state()
+        label_start = v.button_label(ID_STREAM)      # 开始写入后按钮应变成「停止写入」
+        time.sleep(3.0)
+        text_b, h_b = v.last_item_state()
+        root = v.tree()
+        stream_ok = (len(text_b) > len(text_a) and text_b.startswith(text_a) and h_b > h_a
+                     and (not label_start or TXT_STREAM_STOP in label_start))
+        stream_detail = (f"末条文本 {len(text_a)} 字 -> {len(text_b)} 字"
+                         f"（前缀一致：同一条在被追加）| 控件高度 {h_a}px -> {h_b}px"
+                         f" | 按钮文案「{label_start}」 | 状态「{v.status_text(root)}」")
+    except RuntimeError as e:
+        stream_detail = f"流式写入失败：{e}"
+    v.step("流式写入：同一个 listitem 的文本持续变长并把控件撑高", stream_ok, stream_detail,
+           v.shot("20_stream_growing"))
+
+    # 21. 写入过程中**一直往上滑**：每次停下仍然要把末条收回安全线。
+    #     写入不改滚动偏移，所以"真正底部没被收回"只能由回弹逻辑负责——
+    #     这里断言末条不会停在安全线上方（也就是回弹确实发生了），
+    #     下界之后允许的漂移是"回弹完了内容又长了几行"（写入本身不产生滚动事件）。
+    stream_fails: List[str] = []
+    drift_max = 0
+    stream_rounds = 0
+    for i in range(3):
+        try:
+            v.fling_up()
+            m = v.measure()
+        except RuntimeError as e:
+            stream_fails.append(f"第 {i + 1} 次上滑后量不到末条：{e}")
+            continue
+        stream_rounds += 1
+        d = m["delta_vs_safe_line_px"]
+        drift_max = max(drift_max, d)
+        if d < -TOLERANCE_PX:
+            stream_fails.append(f"第 {i + 1} 次上滑后末条停在安全线上方 {d}px"
+                                f"（真正底部没被收回：写入把回弹打断了）")
+        elif d > STREAM_DRIFT_MAX_PX:
+            stream_fails.append(f"第 {i + 1} 次上滑后末条低于安全线 {d}px，"
+                                f"超出内容增长能解释的范围（{STREAM_DRIFT_MAX_PX}px）")
+    v.step("流式写入过程中持续上滑，每次停下末条仍回到安全线", not stream_fails,
+           f"{stream_rounds} 次甩到底后都收回了安全线，最大漂移 {drift_max}px"
+           f"（漂移 = 回弹之后内容又长出来的部分）"
+           if not stream_fails else "；".join(stream_fails),
+           v.shot("21_stream_bounce_during_write"))
+
+    # 22. 写入过程中提示条要跟着让位：内容把末条顶到提示条附近时提示条隐藏
+    v.step("流式写入过程中提示条跟着让位（内容顶到提示条就隐藏）",
+           *v.observe_disclaimer_hidden("22_stream_disclaimer_yield"))
+
+    # 23. 再点一次同一个按钮 -> 停止写入，并**立即结算回弹**（本次要验证的核心动作）
+    drift_before, drift_note = v.wait_stream_drift(12)
+    stop_ok = False
+    stop_detail = f"停止前 {drift_note}"
+    try:
+        v.click_stream()
+        time.sleep(0.4)
+        m = v.measure()
+        text_c, _ = v.last_item_state()
+        time.sleep(2.0)
+        text_d, _ = v.last_item_state()
+        stopped = text_c == text_d
+        label_after = v.button_label(ID_STREAM)      # 停止后按钮应变回「流式写入」
+        label_ok = (not label_after) or (TXT_STREAM_STOP not in label_after)
+        status_hit = (TXT_TOP_SETTLE in m["status"]) if drift_before >= 12 else True
+        stop_ok = (abs(m["delta_vs_safe_line_px"]) <= TOLERANCE_PX
+                   and bool(m["disclaimer_visible"]) and stopped and status_hit and label_ok)
+        stop_detail += (f" -> 停止后末条底边 {m['last_item_bottom']}px / 安全线 {m['safe_line_px']}px"
+                        f"（偏差 {m['delta_vs_safe_line_vp']}vp）"
+                        f" | 提示条{'显示' if m['disclaimer_visible'] else '隐藏'}"
+                        f" | 按钮文案「{label_after}」"
+                        f" | 文本已停{'是' if stopped else '否'}"
+                        f" | 状态「{m['status']}」")
+    except RuntimeError as e:
+        stop_detail += f" -> 停止失败：{e}"
+    v.step("再次点击停止写入：立即回弹到安全线（偏差 0）且提示条恢复", stop_ok, stop_detail,
+           v.shot("23_stream_stop_snap_back"))
+
+    # 24. 流式写入结束后回弹功能回归：再甩到底，末条（此时是一条多行长文本）仍停在安全线
+    after_stream = v.fling_to_effective_bottom("流式写入结束后再甩到底仍回弹到安全线",
+                                               "24_settle_after_stream")
+    v.step("流式结束后的回弹回归：末条仍停在安全线且提示条恢复",
+           bool(after_stream) and abs(after_stream["delta_vs_safe_line_px"]) <= TOLERANCE_PX
+           and bool(after_stream.get("disclaimer_visible")),
+           f"偏差 {after_stream.get('delta_vs_safe_line_vp')}vp | "
+           f"提示条{'显示' if after_stream.get('disclaimer_visible') else '隐藏'}")
 
     # 顶部状态条是排障用的横条，无法完全躲开圆顶弧（圆在 y=0 处宽度为 0），
     # 系统会把窗口裁成圆形，所以两端被裁掉一部分；这里把它作为已知取舍量出来记录。
+    root = v.tree()
     status_node = v.by_text(root, v.status_text(root)) if v.status_text(root) else None
     if status_node is not None and status_node.bounds:
         sb = status_node.bounds
@@ -642,7 +916,7 @@ def main() -> int:
     except RuntimeError as e:
         back_detail = f"点击左按钮失败：{e}"
     v.step("左侧按钮功能保持现状（返回首页）", back_ok, back_detail,
-           v.shot("15_left_button_back"))
+           v.shot("25_left_button_back"))
 
     # ---- 报告 ----
     # 截图像素复核：确认每张都是 466x466 的真实画面（不是黑屏/空帧）
@@ -664,7 +938,8 @@ def main() -> int:
         f"- 设备：HUAWEI WATCH 6（NIZ-AL00），deviceType=wearable，"
         f"{v.size[0]}x{v.size[1]}px @{PX_PER_VP}x = {v.size[0] // PX_PER_VP}x"
         f"{v.size[1] // PX_PER_VP}vp 圆屏",
-        f"- 几何（与 WEARABLE_GEOMETRY 一致）：项高 {ITEM_HEIGHT}vp / 按钮 {BUTTON_HEIGHT}vp / "
+        f"- 几何（与 WEARABLE_GEOMETRY 一致）：项高 {ITEM_HEIGHT}vp / 按钮 {BUTTON_HEIGHT}vp"
+        f"（一行三个，字号 {BUTTON_FONT_VP}vp，左右内边距 {BUTTON_PADDING_VP}vp） / "
         f"按钮底边距 {BUTTON_BOTTOM_MARGIN}vp / 提示条 {DISCLAIMER_HEIGHT}vp / "
         f"末条间隙 {LAST_ITEM_GAP}vp / contentStartOffset {CONTENT_START_OFFSET}vp / "
         f"contentEndOffset {CONTENT_END_OFFSET}vp",
