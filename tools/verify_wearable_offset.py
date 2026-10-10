@@ -26,14 +26,14 @@ import re
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from autoshot.config import load_config            # noqa: E402
-from autoshot.hdc_driver import HdcDriver          # noqa: E402
+from autoshot.hdc_driver import HdcDriver, HdcError  # noqa: E402
 from autoshot import layout as L                   # noqa: E402
 
 TESTAPP = os.path.join(REPO_ROOT, "TestApp")
@@ -81,10 +81,26 @@ APPEND_CLICKS = 6          # 连点中间按钮的次数（每次 +5 条）
 
 # 流式写入期间允许的漂移上限（px）：写入不改滚动偏移、只有滚动停止才结算，
 # 所以"上一次回弹之后内容又长了几行"会体现为末条底边低于安全线。
-# STREAM_MAX_LINES=6、项高 40vp、行高约 1.4*12vp -> 最多约 (6 行 - 1 行) * 34px ≈ 170px。
-# 每次测量都在"甩到底 -> 回弹 -> 又写了 ~2.5s"之后：约 13 字/s、13 字/行 -> 最多约 2.5 行 * 34px ≈ 85px，
-# 取 180px 留足余量（注意这不是"整条能长多高"，那由 OffsetListPage.STREAM_MAX_LINES 决定）。
-STREAM_DRIFT_MAX_PX = 180
+# 写入速度 5.7 字/s、约 12 字一行 -> 约 0.5 行/s -> 约 17px/s；
+# 每个测量点都在"回弹 + 2.2s 甩动 + 1.4s dump"之后，最多累积约 60px。
+# 上限其实被**窗口裁剪**钳住了：末条长高后底边超出屏幕时，控件树给的矩形是裁到窗口的
+# （实测底边读数为 466px = 屏高），所以能观察到的最大漂移 = 466 - 278 = 188px。
+# 取 200px 只做"没跑到天上去"的粗校验；这一项真正的判据是**下界**
+# （漂移 < -TOLERANCE 说明弹回没做，末条还压在框架真正底部）。
+STREAM_DRIFT_MAX_PX = 200
+# dumpLayout 偶发返回残缺树时的重取次数与间隔
+TREE_RETRY = 4
+TREE_RETRY_INTERVAL_S = 0.4
+# 永远在屏上的常量 id：拿它们判断"这次 dump 是不是完整的"
+REQUIRE_ALWAYS = (ID_LIST, ID_BUTTON, ID_APPEND, ID_STREAM)
+
+
+class DeviceOfflineError(Exception):
+    """设备掉线。
+
+    刻意**不继承 RuntimeError**：脚本里大量 `except RuntimeError` 是用来兜"这一次量不到"的，
+    掉线必须一路抛到 main 中止整轮，不能被降级成"8 次甩动后仍量不到末条"这种看不出来的结论。
+    """
 
 
 class Verifier:
@@ -95,6 +111,8 @@ class Verifier:
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
         self.steps: List[dict] = []
+        # 运行期间被切走（用户动过手表 / 系统弹窗 / 应用重启）的阶段名，最后一个步骤会汇总
+        self.recoveries: List[str] = []
         self.failures: List[str] = []
         self.notes: List[str] = []
         self.size = self.drv.display_size()
@@ -108,8 +126,22 @@ class Verifier:
             raise RuntimeError(f"读不到 bundleName: {path}")
         return m.group(1)
 
-    def tree(self) -> L.Node:
-        return L.parse_tree(self.drv.dump_layout())
+    def tree(self, require: Sequence[str] = ()) -> L.Node:
+        """取控件树。
+
+        `uitest dumpLayout` 在这块表上一次要 1.3~3.6s，而且 UI 频繁重渲染时会**偶发返回
+        几乎空白的树**（流式写入期间实测抓到过一条节点都没有：末条、连底部按钮都读不到，
+        截图里画面明明正常）。所以：`require` 里给的 id 只要有一个不在树里就重取，
+        最多 TREE_RETRY 次——常量 id（列表 / 三个底部按钮）永远在屏上，拿它们当"这次 dump
+        是不是完整的"判据最省事。
+        """
+        root = L.parse_tree(self.drv.dump_layout())
+        for _ in range(TREE_RETRY - 1):
+            if not require or all(self.by_id(root, k) is not None for k in require):
+                return root
+            time.sleep(TREE_RETRY_INTERVAL_S)
+            root = L.parse_tree(self.drv.dump_layout())
+        return root
 
     @staticmethod
     def by_id(root: L.Node, node_id: str) -> Optional[L.Node]:
@@ -195,7 +227,7 @@ class Verifier:
         return self.click_button(ID_STREAM, "底部最右按钮 offset_stream_button")
 
     def click_button(self, node_id: str, label: str) -> tuple:
-        node = self.by_id(self.tree(), node_id)
+        node = self.by_id(self.tree(require=REQUIRE_ALWAYS), node_id)
         if node is None or node.bounds is None:
             raise RuntimeError(f"量不到{label}")
         cx, cy = node.center()
@@ -235,7 +267,7 @@ class Verifier:
         deadline = time.time() + 4.0
         while time.time() < deadline:
             try:
-                root = self.tree()
+                root = self.tree(require=REQUIRE_ALWAYS)
             except Exception:                      # noqa: BLE001 - 拖动中 dump 偶发失败，重试即可
                 continue
             samples += 1
@@ -252,7 +284,8 @@ class Verifier:
     # ---- 量测 ----
     def measure(self) -> dict:
         """量末条 / 按钮 / 提示条的位置，算出实际落点相对安全线的偏差。"""
-        root = self.tree()
+        self.check_device()      # 掉线时会返回陈旧树，必须当场中止（见 check_device）
+        root = self.tree(require=REQUIRE_ALWAYS)
         item = self.by_id(root, ID_LAST_ITEM)
         button = self.by_id(root, ID_BUTTON)
         disclaimer = self.by_text(root, TXT_DISCLAIMER)
@@ -284,7 +317,7 @@ class Verifier:
         滚出屏幕后它可能还挂在树上。判据用末条矩形与列表矩形的**交集**（与页内
         measureLastItemBottomPx 的口径一致）。
         """
-        root = self.tree()
+        root = self.tree(require=REQUIRE_ALWAYS)
         item = self.by_id(root, ID_LAST_ITEM)
         lst = self.by_id(root, ID_LIST)
         if item is None or item.bounds is None:
@@ -308,7 +341,7 @@ class Verifier:
 
     def last_item_state(self) -> tuple:
         """末条的（子树文本, 控件高度 px）：流式写入用它证明"同一条在变长"。"""
-        node = self.by_id(self.tree(), ID_LAST_ITEM)
+        node = self.by_id(self.tree(require=(ID_LIST, ID_BUTTON)), ID_LAST_ITEM)
         if node is None or node.bounds is None:
             return "", 0
         b = node.bounds
@@ -322,7 +355,9 @@ class Verifier:
         while time.time() < deadline:
             samples += 1
             try:
-                if self.by_text(self.tree(), TXT_DISCLAIMER) is None:
+                # 必须要求"这一次 dump 是完整的"：dumpLayout 偶发返回空树，
+                # 空树会被误判成"提示条已让位"（假通过）。
+                if self.by_text(self.tree(require=REQUIRE_ALWAYS), TXT_DISCLAIMER) is None:
                     return (True, f"轮询 {samples} 次后提示条节点消失（内容增长期间让位生效）",
                             self.shot(shot_name))
             except RuntimeError:
@@ -352,7 +387,7 @@ class Verifier:
 
     def button_label(self, node_id: str) -> str:
         """按钮控件树上的文案（读不到返回空串：只用于报告，不单独作为失败判据）。"""
-        node = self.by_id(self.tree(), node_id)
+        node = self.by_id(self.tree(require=REQUIRE_ALWAYS), node_id)
         return L.normalize_text(node.text) if node is not None else ""
 
     def check_button_labels(self, shot_path: str, targets: List[tuple]) -> tuple:
@@ -428,6 +463,38 @@ class Verifier:
             self.failures.append(f"{name}: {detail}")
         print(f"[{'PASS' if ok else 'FAIL'}] {name} — {detail}")
 
+    def check_device(self) -> None:
+        """阶段边界确认设备还在线。
+
+        真机实测：USB 一掉线，`uitest dumpLayout` / `screenCap` 会继续"成功"返回设备上**上一次**
+        留下的文件——于是控件树和截图同时冻结在第 7 步的状态（19 张截图逐字节相同、
+        树里连末条都没有），后面每一步都以"量不到"失败，完全看不出真正原因。
+        宁可在这里明确报错。
+        """
+        try:
+            serials = HdcDriver.list_devices(self.cfg.get("hdc_path", "hdc"))
+        except HdcError as e:
+            raise DeviceOfflineError(f"设备离线（{e}）") from None
+        if not serials:
+            raise DeviceOfflineError(
+                "设备离线（hdc list targets 为空）：USB 掉线后 dumpLayout/截图会返回上一次的陈旧文件"
+                "（实测 19 张截图逐字节相同、控件树冻结在某一步），本脚本的结果不可信，"
+                "请重新连接设备后重跑")
+
+    def phase(self, where: str) -> None:
+        """每个阶段开始前确认应用还在 OffsetListPage 上；被切走就自动重新导航回来。
+
+        真机实测：应用被切到后台/重启过之后，脚本后续的滑动会全部打在桌面（launcher）上，
+        一连串检查会以「量不到末条 / 量不到按钮」连锁失败，看不出真正原因。
+        这里把「切走了」显式记下来，最后单独出一条结论。
+        """
+        self.check_device()
+        root = self.tree()
+        if self.by_id(root, ID_LIST) is not None:
+            return
+        self.recoveries.append(where)
+        self.goto_offset_page()
+
     def goto_offset_page(self) -> None:
         # force-stop 后再 start：避免上次运行停在 OffsetListPage 上直接复用旧路由栈
         try:
@@ -438,7 +505,7 @@ class Verifier:
         self.drv.app_start(self.bundle)
         time.sleep(3.0)
         for _ in range(8):
-            root = self.tree()
+            root = self.tree(require=REQUIRE_ALWAYS)
             entry = self.by_text(root, TXT_ENTRY)
             if entry is not None and entry.bounds:
                 cx, cy = entry.center()
@@ -528,6 +595,7 @@ def main() -> int:
     v = Verifier(args.out_dir)
     print(f"设备: {v.size} px, bundle={v.bundle}, 输出目录={v.out_dir}")
 
+    v.check_device()
     v.goto_offset_page()
 
     v.notes.append(
@@ -549,14 +617,24 @@ def main() -> int:
         "宽度不小于理论宽度的 75%（否则就是被省略号截断）。")
     v.notes.append(
         "**流式文本用例（底部最右按钮）**：写入目标锁定为**当前末条那一个 listitem**"
-        "（锁定 id，不随「最后一条」漂移），每 150ms 追加 2 个字符，一行行把控件撑高。"
-        "因为数据变更**不产生滚动事件**，所以这一段里没有任何自动结算："
-        "① 用户滚到底停下时，硬约束照常把末条收回安全线（第 16 项：末条不会停在安全线上方）；"
-        "② 每次回弹之后内容继续长，末条底边会低于安全线一点——这段漂移是「内容又长出来了」，"
-        f"上限取 {STREAM_DRIFT_MAX_PX}px（每次测量点都在回弹后约 2.5s，约 2.5 行的增长量）；"
-        "③ 点「停止写入」那一下立即结算，末条一次收回到安全线（第 18 项，偏差 0）。"
+        "（锁定 id，不随「最后一条」漂移），每 350ms 追加 2 个字符（约 5.7 字/s、约 2s 一行），"
+        "一行行把控件撑高；行数上限 12 行，真机验证全程都在长高、不会中途停住。"
+        "因为数据变更**不产生滚动事件**，所以这一段里没有「每次写入都结算」这种事："
+        "① 用户滚到底停下时，硬约束照常把末条收回安全线（第 21 项：末条不会停在安全线上方）；"
+        "② 每次回弹之后内容继续长，末条底边会低于安全线一点——这段漂移就是「内容又长出来了」；"
+        "③ 点「停止写入」那一下立即结算，末条一次收回到安全线（第 23 项，偏差 0）。"
         "停止用的是 force=false：用户要是已经翻到列表中段（末条不在屏上），不该被拽回底部。"
         "项高不再是固定值：普通项用 constraintSize(minHeight) 兜住 40vp，流式那一项随文本长高。")
+    v.notes.append(
+        "**流式写入暴露出的真 bug：回弹动画永远落不了地（本次修复）**。真机日志（每 250ms 一条）："
+        "「onScrollStop: reachedEnd=true -> force=true / settle: 发起修正 delta=-71.6 target=1359.0 "
+        "animate=true / measure: itemBottom=134.8 safe=278.0 overflow=-71.62」——列表被框架钉在"
+        "**真正底部**（isAtEnd 一直为 true），内容每几百毫秒长一次就把它重新钉回末尾，"
+        "还在飞的回弹动画被下一次内容变更取消，于是修正永远不生效、还以 4Hz 反复重发，"
+        "末条始终停在 134px（安全线上方 71vp＝用户看到的「划到底不回弹」）。"
+        "修法：**流式写入期间改用瞬移修正**（animate=false）——下一帧就落地，落地后偏移已离开末尾"
+        "（不再 isAtEnd），后续内容增长不会再把它拽回真底，回弹才算真的发生。"
+        "正常（非流式）场景仍然用 BOUNCE_DURATION 的动画回弹。")
     v.notes.append(
         "为让整行不被圆边裁掉，穿戴参数下给 List 加了左右各 8vp 内缩（listPadding，手机为 0）；"
         "该内缩只影响水平方向，安全线是纵向计算，不受影响。")
@@ -707,6 +785,7 @@ def main() -> int:
            f"偏差 {fourth.get('delta_vs_safe_line_vp')}vp")
 
     # 10. 底部按钮改成一行并排三个（左：原功能返回；中：从底部追加 5 条；右：模拟流式文本）
+    v.phase("第 10~13 项（底部三个按钮 / 文案像素 / 追加）")
     root = v.tree()
     left_btn = v.by_id(root, ID_BUTTON)
     mid_btn = v.by_id(root, ID_APPEND)
@@ -762,6 +841,7 @@ def main() -> int:
            if not append_fails else "；".join(append_fails),
            v.shot("16_append_bottom_disclaimer_hidden"))
 
+    v.phase("第 14~15 项（圆屏内接 / 追加后回弹）")
     # 12. 插完再滚到**新的**有效底部：末条重新落到安全线，提示条恢复显示
     after_append = v.fling_to_effective_bottom("插入后滚到新的有效底部", "17_settle_after_append")
     v.step("插入后新底部仍停在安全线且提示条恢复",
@@ -796,25 +876,36 @@ def main() -> int:
            v.shot("19_circle_containment"))
 
     # ---- 流式文本（底部最右按钮）：模拟"一直往一个 listitem 里写数据" ----
-    # 20. 点最右按钮开始写入：内容写进**同一个 listitem**（末条），文本持续变长、控件跟着长高
+    v.phase("第 20~24 项（流式写入 / 边写边滑回弹 / 停止回弹）")
+    # 20. 点最右按钮开始写入：内容写进**同一个 listitem**（末条），文本持续变长、控件跟着长高。
+    #     判据用"状态计数器在动 + 控件高度出现多个值"，不去比对文本前缀：
+    #     页面每写满一轮会在**同一条**里重开（文本被重置），前缀式断言会被这一下打翻，
+    #     而"同一条"由 listitem 的 id（offset_last_item）保证——这一段里条目数一直没变。
     stream_ok = False
     stream_detail = ""
     try:
         v.click_stream()
-        time.sleep(0.3)
-        text_a, h_a = v.last_item_state()
-        label_start = v.button_label(ID_STREAM)      # 开始写入后按钮应变成「停止写入」
-        time.sleep(3.0)
-        text_b, h_b = v.last_item_state()
-        root = v.tree()
-        stream_ok = (len(text_b) > len(text_a) and text_b.startswith(text_a) and h_b > h_a
+        samples = []
+        label_start = ""
+        for wait in (0.4, 1.8, 2.2):
+            time.sleep(wait)
+            _text, h = v.last_item_state()
+            root = v.tree()
+            samples.append((v.status_text(root), h))
+            if not label_start:
+                label_start = v.button_label(ID_STREAM)   # 开始写入后按钮应变成「停止写入」
+        statuses = [s for s, _ in samples]
+        heights = [h for _, h in samples]
+        moved = sum(1 for a, b in zip(statuses, statuses[1:]) if a != b)
+        grew = len({h for h in heights}) >= 2 and max(heights) > heights[0]
+        stream_ok = (moved >= 2 and grew and all(statuses)
                      and (not label_start or TXT_STREAM_STOP in label_start))
-        stream_detail = (f"末条文本 {len(text_a)} 字 -> {len(text_b)} 字"
-                         f"（前缀一致：同一条在被追加）| 控件高度 {h_a}px -> {h_b}px"
-                         f" | 按钮文案「{label_start}」 | 状态「{v.status_text(root)}」")
+        stream_detail = (f"3 次采样状态都在变（{moved} 次变化）：{statuses[0]} -> {statuses[-1]}"
+                         f" | 末条控件高度 {heights[0]}px -> {heights[1]}px -> {heights[2]}px"
+                         f"（同一条在长高）| 按钮文案「{label_start}」")
     except RuntimeError as e:
         stream_detail = f"流式写入失败：{e}"
-    v.step("流式写入：同一个 listitem 的文本持续变长并把控件撑高", stream_ok, stream_detail,
+    v.step("流式写入：同一个 listitem 在持续写入并把控件撑高", stream_ok, stream_detail,
            v.shot("20_stream_growing"))
 
     # 21. 写入过程中**一直往上滑**：每次停下仍然要把末条收回安全线。
@@ -861,7 +952,7 @@ def main() -> int:
         text_c, _ = v.last_item_state()
         time.sleep(2.0)
         text_d, _ = v.last_item_state()
-        stopped = text_c == text_d
+        stopped = bool(text_c) and text_c == text_d
         label_after = v.button_label(ID_STREAM)      # 停止后按钮应变回「流式写入」
         label_ok = (not label_after) or (TXT_STREAM_STOP not in label_after)
         status_hit = (TXT_TOP_SETTLE in m["status"]) if drift_before >= 12 else True
@@ -918,6 +1009,12 @@ def main() -> int:
     v.step("左侧按钮功能保持现状（返回首页）", back_ok, back_detail,
            v.shot("25_left_button_back"))
 
+    # 26. 运行期完整性：应用全程没被切走（切走了说明有外部干扰，上面的结论要打折）
+    v.step("运行期间应用一直在 OffsetListPage 上（没有被切走）", not v.recoveries,
+           "全程未被切走" if not v.recoveries
+           else f"被切走 {len(v.recoveries)} 次、已自动重新进入页面：{'；'.join(v.recoveries)}"
+                f"（切走期间的状态不作数，相关结论要打折看）")
+
     # ---- 报告 ----
     # 截图像素复核：确认每张都是 466x466 的真实画面（不是黑屏/空帧）
     shot_stats = []
@@ -968,4 +1065,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except DeviceOfflineError as e:
+        # 掉线时 dumpLayout / screenCap 会一路"成功"返回陈旧文件，这一轮的结论全部不可信，
+        # 直接中止并说清原因，别产出一份看着像真失败的报告。
+        print(f"\n[中止] {e}")
+        sys.exit(2)

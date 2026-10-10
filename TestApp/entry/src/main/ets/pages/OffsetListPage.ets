@@ -240,16 +240,22 @@ const APPEND_SIZE: number = 5;
 const APPEND_LAYOUT_GUARD_MS: number = 500;
 
 // ---- 流式文本（底部最右按钮）----
-/** 每两次写入之间的间隔（ms）：模拟逐字下发的流式输出 */
-const STREAM_INTERVAL_MS: number = 150;
+/** 每两次写入之间的间隔（ms）：模拟逐字下发的流式输出。
+ *
+ *  取 350ms（约 5.7 字/s、约 2s 长一行）而不是更快的 150ms：
+ *  真机验证全程约 15~20s 都要处在"内容还在长"的状态里，
+ *  这样"停止写入"那一下才一定还有内容增长留下的落差可以回弹（见 AGENTS.md）。
+ *  写太快会在几秒内把行数顶到上限、之后就没有新落差了，验证会变成空跑。 */
+const STREAM_INTERVAL_MS: number = 350;
 /** 每次写入的字符数 */
 const STREAM_CHARS_PER_TICK: number = 2;
 /** 一轮最多写多少字：写满就在**同一条**里重开一轮（否则末条会无限变高） */
 const STREAM_MAX_CHARS: number = 600;
 /**
  * 流式写入时这一条允许的最大行数（内容长高的上限）。
- * 取 20 行（约 336vp）：真机验证全程约 15s、写入速度 13 字/s，末条还在一路长高，
- * 不会中途碰到上限——这样"停止写入"那一下就一定还有内容增长留下的落差可以回弹。
+ * 取 20 行（约 336vp）：写入约 5~10 字/s，长满要二三十秒，
+ * 手动演示时"一边写一边滑"能一直保持内容在长；
+ * 长满之后只是不再长高，回弹逻辑照常（末条底边仍在安全线上）。
  */
 const STREAM_MAX_LINES: number = 20;
 /** 流式写入的语料（循环取字符，模拟模型逐字输出） */
@@ -261,16 +267,79 @@ const STREAM_SENTENCE: string =
  *
  * 必须带一个**稳定 id**：流式写入每 150ms 改一次末条的文本，
  * 如果还像以前那样用文本本身当 ForEach 的 key，每写一次都会被当成"新数据"，
- * 整条 ListItem 重建（id 会飘、无法验证"一直在同一个 listitem 里写"），
- * 而且重建期间 getRectangleById 量到的是旧布局。
+ * 整条 ListItem 重建（id 会飘、无法验证"一直在同一个 listitem 里写"）。
+ *
+ * 但**只有稳定 key 还不够**：ForEach 的键值不变时会复用旧组件、**不再执行 itemGenerator**，
+ * 所以"键值稳定 + 把 Text(item.text) 写在 itemGenerator 里"这个组合在真机上根本不刷新
+ * ——实测写入到 492 字，控件树里那条还是 15 字、项高停在 40vp 一直没长高。
+ * 正确做法是 @Observed + 子组件 @ObjectLink：改的是同一个对象的属性，
+ * 由框架只通知这一行重渲染（父组件和 ForEach 都不用重跑，反而更省）。
  */
+@Observed
 class OffsetItem {
   id: number;
   text: string;
+  /** 是否做过流式写入目标：目标项允许折行、允许随文本长高；停写后保持长文本不回收 */
+  growing: boolean;
 
   constructor(id: number, text: string) {
     this.id = id;
     this.text = text;
+    this.growing = false;
+  }
+}
+
+/**
+ * 列表行。
+ *
+ * 拆成子组件就是为了用 @ObjectLink 盯住**这一条数据对象**：
+ * 流式写入改 `item.text` / `item.growing` 时，只有这一行重渲染。
+ */
+@Component
+struct OffsetRow {
+  @ObjectLink item: OffsetItem;
+  /** 序号（1 起） */
+  @Prop index: number = 1;
+  /** 是不是末条：红色徽标 + 浅红底 + 「末条」标签 */
+  @Prop isLast: boolean = false;
+  /** 几何参数（常量，构造时由父组件按设备给一次） */
+  geom: OffsetGeometry = PHONE_GEOMETRY;
+
+  build() {
+    Row({ space: this.geom.itemRowSpace }) {
+      Text(`${this.index}`)
+        .fontSize(this.geom.badgeFontSize)
+        .fontColor('#FFFFFF')
+        .textAlign(TextAlign.Center)
+        .width(this.geom.badgeSize)
+        .height(this.geom.badgeSize)
+        .borderRadius(this.geom.badgeSize / 2)
+        .backgroundColor(this.isLast ? '#E64545' : '#8C8C8C')
+      Text(this.item.text)
+        .fontSize(this.geom.itemFontSize)
+        .fontColor('#333333')
+        .layoutWeight(1)
+        .maxLines(this.item.growing ? STREAM_MAX_LINES : 1)
+        .textOverflow({
+          overflow: this.item.growing ? TextOverflow.Clip : TextOverflow.Ellipsis
+        })
+      if (this.isLast) {
+        Text('末条')
+          .fontSize(this.geom.tagFontSize)
+          .fontColor('#E64545')
+      }
+    }
+    .width('100%')
+    // 普通项：内容撑不到项高，用 minHeight 兜住；
+    // 流式写入那一项：文本一行行长出来，整条跟着变高（minHeight 不再起作用）
+    .constraintSize({ minHeight: this.geom.itemHeight })
+    .padding({ left: this.geom.itemPadding, right: this.geom.itemPadding })
+    .backgroundColor(this.isLast ? '#FFF1F0' : '#F2F3F5')
+    .borderRadius(8)
+    .border({
+      width: this.isLast ? 1 : 0,
+      color: '#E64545'
+    })
   }
 }
 
@@ -674,12 +743,20 @@ struct OffsetListPage {
     this.correctionStartedAt = Date.now();
     this.correctionFromOffset = current;
     this.statusText = `自动滚回底部 · 修正 ${delta.toFixed(0)}vp`;
+    // 流式写入期间必须用**瞬移**修正（动画版回弹在真机上根本落不了地）：
+    // 内容持续增长时列表被框架钉在"真正底部"，还在飞的回弹动画会被下一次内容变更取消、
+    // 偏移又被打回末尾，于是修正永远不生效、还会以 4Hz 反复重发（真机日志：
+    // "发起修正 delta=-71.6 target=1359 animate=true" 每 250ms 一条，末条始终停在 134px）。
+    // 瞬移在下一帧就落地，落地后偏移已经离开末尾（不再是 isAtEnd），
+    // 后续增长不会再把它拽回真底——回弹才算真的发生。
+    const useAnimation: boolean = animate && !this.streaming;
     hilog.info(DBG_DOMAIN, DBG_TAG,
-      `settle: 发起修正 delta=${delta.toFixed(1)} target=${target.toFixed(1)} animate=${animate}`);
+      `settle: 发起修正 delta=${delta.toFixed(1)} target=${target.toFixed(1)} ` +
+      `animate=${useAnimation}${useAnimation === animate ? '' : '（流式写入中，改用瞬移）'}`);
     this.scroller.scrollTo({
       xOffset: 0,
       yOffset: target,
-      animation: animate ? { duration: BOUNCE_DURATION, curve: Curve.EaseOut } : false
+      animation: useAnimation ? { duration: BOUNCE_DURATION, curve: Curve.EaseOut } : false
     });
   }
 
@@ -757,8 +834,12 @@ struct OffsetListPage {
     this.streamRound++;
     this.streamWritten = 0;
     this.streamCursor = 0;
-    this.streamItemId = this.items[this.items.length - 1].id;
-    this.setStreamItemText(`流式输出 ${this.streamRound}：`);
+    const last: number = this.items.length - 1;
+    this.streamItemId = this.items[last].id;
+    // growing 一旦置上就不再回收：停写后这一条仍然保持多行长文本（真实流式输出的样子），
+    // 否则停止瞬间项高缩回 40vp，屏上内容会突然消失、几何也会跳一下。
+    this.items[last].growing = true;
+    this.items[last].text = `流式输出 ${this.streamRound}：`;
     this.statusText = `流式写入中 · 第${this.streamRound}轮 · 0 字`;
     hilog.info(DBG_DOMAIN, DBG_TAG,
       `stream: 开始写入 itemId=${this.streamItemId}（第${this.streamRound}轮）`);
@@ -795,12 +876,18 @@ struct OffsetListPage {
       this.clearStreamTimer();
       return;
     }
+    const idx: number = this.findStreamIndex();
+    if (idx < 0) {
+      hilog.info(DBG_DOMAIN, DBG_TAG, 'stream: 目标列表项已不在，停止写入');
+      this.stopStream();
+      return;
+    }
     if (this.streamWritten >= STREAM_MAX_CHARS) {
-      // 写满一轮：同一条重新开始，否则末条会一直长高、把整个可视区吃光
+      // 写满一轮：同一条重新开始，否则末条会一直长高
       this.streamRound++;
       this.streamWritten = 0;
       this.streamCursor = 0;
-      this.setStreamItemText(`流式输出 ${this.streamRound}：`);
+      this.items[idx].text = `流式输出 ${this.streamRound}：`;
       this.statusText = `流式写入中 · 第${this.streamRound}轮（上一轮写满 ${STREAM_MAX_CHARS} 字，同一条重开）`;
       hilog.info(DBG_DOMAIN, DBG_TAG, `stream: 第${this.streamRound}轮（同一条重开）`);
       return;
@@ -811,44 +898,24 @@ struct OffsetListPage {
       this.streamCursor++;
     }
     this.streamWritten += STREAM_CHARS_PER_TICK;
-    const text: string = this.findStreamItemText();
-    if (text.length === 0) {
-      hilog.info(DBG_DOMAIN, DBG_TAG, 'stream: 目标列表项已不在，停止写入');
-      this.stopStream();
-      return;
-    }
-    this.setStreamItemText(text + chunk);
+    // 改的是同一个 @Observed 对象的属性 -> 框架只通知对应那一行（@ObjectLink）重渲染。
+    // 不换数组、不换对象，所以父组件和 ForEach 都不用重跑（真机上这点很要紧：
+    // 每 150ms 重跑一次带 70 项的 ForEach 会让 dumpLayout 都变得不可靠）。
+    this.items[idx].text = this.items[idx].text + chunk;
     this.statusText = `流式写入中 · 第${this.streamRound}轮 · ${this.streamWritten} 字`;
     // 末条被顶到提示条跟前时提示条要让位；这里量到的可能是"这一次增长之前"的布局，
     // 但让位判定是上闩的（只会更早隐藏、不会来回抖），下一帧/下一次滚动会自然对齐。
     this.updateDisclaimerVisibility();
   }
 
-  /** 锁定项的当前文本，找不到返回空串 */
-  private findStreamItemText(): string {
+  /** 锁定项在 items 里的下标（-1 = 找不到） */
+  private findStreamIndex(): number {
     for (let i = 0; i < this.items.length; i++) {
       if (this.items[i].id === this.streamItemId) {
-        return this.items[i].text;
+        return i;
       }
     }
-    return '';
-  }
-
-  /** 这一条是不是当前流式写入的目标（目标项允许折行、跟着内容长高） */
-  private isStreamTarget(item: OffsetItem): boolean {
-    return this.streaming && item.id === this.streamItemId;
-  }
-
-  /** 改写锁定项的文本（换新数组 + 换新对象：数组元素替换会触发 @State 刷新） */
-  private setStreamItemText(text: string): void {
-    for (let i = 0; i < this.items.length; i++) {
-      if (this.items[i].id === this.streamItemId) {
-        const copy: OffsetItem[] = this.items.slice();
-        copy[i] = new OffsetItem(this.streamItemId, text);
-        this.items = copy;
-        return;
-      }
-    }
+    return -1;
   }
 
   /** 列表是否停在顶部 */
@@ -881,39 +948,11 @@ struct OffsetListPage {
         List({ space: this.geom.itemSpace, scroller: this.scroller }) {
           ForEach(this.items, (item: OffsetItem, idx: number) => {
             ListItem() {
-              Row({ space: this.geom.itemRowSpace }) {
-                Text(`${idx + 1}`)
-                  .fontSize(this.geom.badgeFontSize)
-                  .fontColor('#FFFFFF')
-                  .textAlign(TextAlign.Center)
-                  .width(this.geom.badgeSize)
-                  .height(this.geom.badgeSize)
-                  .borderRadius(this.geom.badgeSize / 2)
-                  .backgroundColor(idx === this.items.length - 1 ? '#E64545' : '#8C8C8C')
-                Text(item.text)
-                  .fontSize(this.geom.itemFontSize)
-                  .fontColor('#333333')
-                  .layoutWeight(1)
-                  .maxLines(this.isStreamTarget(item) ? STREAM_MAX_LINES : 1)
-                  .textOverflow({
-                    overflow: this.isStreamTarget(item) ? TextOverflow.Clip : TextOverflow.Ellipsis
-                  })
-                if (idx === this.items.length - 1) {
-                  Text('末条')
-                    .fontSize(this.geom.tagFontSize)
-                    .fontColor('#E64545')
-                }
-              }
-              .width('100%')
-              // 普通项：内容撑不到项高，用 minHeight 兜住；
-              // 流式写入那一项：文本一行行长出来，整条跟着变高（minHeight 不再起作用）
-              .constraintSize({ minHeight: this.geom.itemHeight })
-              .padding({ left: this.geom.itemPadding, right: this.geom.itemPadding })
-              .backgroundColor(idx === this.items.length - 1 ? '#FFF1F0' : '#F2F3F5')
-              .borderRadius(8)
-              .border({
-                width: idx === this.items.length - 1 ? 1 : 0,
-                color: '#E64545'
+              OffsetRow({
+                item: item,
+                index: idx + 1,
+                isLast: idx === this.items.length - 1,
+                geom: this.geom
               })
             }
             // 末条单独一个 id，供 getRectangleById 实测位置
